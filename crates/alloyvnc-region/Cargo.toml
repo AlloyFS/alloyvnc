@@ -1,0 +1,12 @@
+[package]
+name = "alloyvnc-region"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rectangles and y-x banded regions for damage tracking."
+
+[lints]
+workspace = true
+
+[dependencies]

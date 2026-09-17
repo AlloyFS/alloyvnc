@@ -1,0 +1,15 @@
+[package]
+name = "alloyvnc-screen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "What a server captures from and types into: the screen traits, and a synthetic screen for tests and measurements."
+
+[lints]
+workspace = true
+
+[dependencies]
+alloyvnc-encode.workspace = true
+alloyvnc-region.workspace = true
+thiserror.workspace = true

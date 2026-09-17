@@ -1,0 +1,23 @@
+[package]
+name = "alloyvnc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A VNC server that sends only what changed."
+
+[lints]
+workspace = true
+
+[dependencies]
+alloyvnc-encode.workspace = true
+alloyvnc-proto.workspace = true
+alloyvnc-region.workspace = true
+alloyvnc-screen.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

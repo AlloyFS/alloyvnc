@@ -1,0 +1,9 @@
+/target
+/scratch
+
+# Agent worktrees and session scratch, never part of the tree.
+/.claude/
+
+# Every .env, not only the bare name.
+.env*
+!.env.example

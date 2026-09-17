@@ -1,0 +1,2 @@
+# Matches alloyfs: wide enough that a match arm with a comment fits on one line.
+max_width = 110

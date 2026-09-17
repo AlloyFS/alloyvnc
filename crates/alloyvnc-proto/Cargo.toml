@@ -1,0 +1,15 @@
+[package]
+name = "alloyvnc-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The RFB wire format: pixel formats, messages, handshake and VNC authentication, with no I/O."
+
+[lints]
+workspace = true
+
+[dependencies]
+des.workspace = true
+rand.workspace = true
+thiserror.workspace = true
