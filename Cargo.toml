@@ -6,6 +6,7 @@ members = [
     "crates/alloyvnc-encode",
     "crates/alloyvnc-screen",
     "crates/alloyvnc-screen-dxgi",
+    "crates/alloyvnc-screen-x11",
     "crates/alloyvnc",
 ]
 

@@ -61,6 +61,11 @@ struct ServeArgs {
     /// Ceiling on updates per second to one client.
     #[arg(long, default_value_t = 60)]
     max_fps: u32,
+
+    /// The X display to capture, as DISPLAY names it (":0", "host:1").
+    #[cfg(target_os = "linux")]
+    #[arg(long, env = "DISPLAY")]
+    display: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -70,6 +75,9 @@ enum Backend {
     /// The Windows desktop, through DXGI duplication.
     #[cfg(windows)]
     Dxgi,
+    /// The X11 desktop of $DISPLAY, through XDamage and MIT-SHM.
+    #[cfg(target_os = "linux")]
+    X11,
 }
 
 #[tokio::main]
@@ -109,6 +117,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
         Backend::Dxgi => {
             let capture = open_dxgi()?;
             let input = alloyvnc_screen_dxgi::WinInput::new(capture.origin());
+            (Box::new(capture), Box::new(input))
+        }
+        // Both halves open their own connection to $DISPLAY: the capture
+        // reads events on the capture thread while input writes from the
+        // session, and one connection is not two streams.
+        #[cfg(target_os = "linux")]
+        Backend::X11 => {
+            let capture = alloyvnc_screen_x11::X11Capture::new(args.display.as_deref())?;
+            let input = alloyvnc_screen_x11::X11Input::new(args.display.as_deref())?;
             (Box::new(capture), Box::new(input))
         }
     };

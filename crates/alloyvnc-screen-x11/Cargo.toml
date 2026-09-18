@@ -1,0 +1,23 @@
+[package]
+name = "alloyvnc-screen-x11"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Linux: the X11 desktop through XDamage and MIT-SHM, keys and the pointer through XTEST."
+
+[lints]
+workspace = true
+
+[dependencies]
+alloyvnc-screen.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The pure-Rust connection, so there is no libxcb to link against. The five
+# extensions are the whole backend: damage says what changed, shm carries the
+# pixels without a round trip through the socket, xfixes holds the pointer
+# and the region algebra damage answers in, randr reports a resize, and
+# xtest injects the keys and the pointer.
+x11rb = { version = "0.14", features = ["damage", "randr", "shm", "xfixes", "xtest"] }
+libc = "0.2"

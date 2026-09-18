@@ -187,8 +187,9 @@ the unsafe.
    character off the layout arrives.
 5. **Browser path.** WebSocket, the noVNC bundle, TLS. Gate: noVNC in the rig
    at 1080p, fps and latency from the rig's scripts, no websockify.
-6. **Linux.** The X11 backend against WSLg's XWayland and Xvfb on azure. Gate:
-   the same scenarios.
+6. **Linux.** The X11 backend against Xvfb, here in WSL and on azure; WSLg's
+   own display cannot be captured (see the findings). Gate: the same
+   scenarios.
 7. **Hardening and reach.** VeNCrypt; service mode on Windows (logon screen,
    UAC, the secure desktop; alloyfs's `service/spawn.rs` already does the
    session handoff); Wayland through PipeWire and the RemoteDesktop portal;
@@ -355,3 +356,25 @@ Things measured or observed that changed the plan, newest last.
   noVNC tab visible on the captured desktop every update changes the screen
   and produces the next. Measurements keep the tab hidden: `cdp.ts open`
   fronts a tab, `Target.createTarget` with `background: true` does not.
+- **2026-09-18, WSLg's display cannot be captured by anyone.** XWayland runs
+  rootless there: client windows are Wayland surfaces, the root window holds
+  no pixels and receives no damage. Every X11 capture of `:0` sees black and
+  zero damage events while every extension answers, which is what makes it
+  look like a bug. The Linux backend is checked against Xvfb (`:99`,
+  1280x720x24, on its socket, which needs `/tmp/.X11-unix` remounted
+  writable in WSL; it reverts on `wsl --shutdown`) and, later, Xvfb on
+  azure. Colours proved the byte order: steelblue 70/130/180 lands as BGRX
+  [180, 130, 70].
+- **2026-09-18, X11 reports no moves, ever.** A scroll is damage over the
+  scrolled area, never a shifted block. With DXGI reporting none on Windows
+  11 either, CopyRect on both platforms rests on phase 2's compare pass.
+- **2026-09-18, fetching X damage: the bounding box beats the rectangles
+  once they are many.** Release build, adjacent runs, a fixed scenario of
+  160 banded rectangles on the 1280x720 Xvfb: server CPU 10 to 20 ms per
+  3.1 s scenario with one GetImage of the bounding box, 140 to 160 ms with
+  one per rectangle, pipelined. Each rectangle costs the X server a GetImage
+  and this side a reply to parse, about twenty microseconds, while the whole
+  screen is one or two milliseconds. The backend fetches one by one up to
+  64 rectangles and the bounding box past that; comparing areas rather than
+  counts is on the backlog, behind phase 2, which changes the shape of the
+  damage anyway.

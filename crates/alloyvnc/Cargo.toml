@@ -26,3 +26,8 @@ tracing-subscriber.workspace = true
 # Win32 dependency and is absent everywhere else.
 [target.'cfg(windows)'.dependencies]
 alloyvnc-screen-dxgi = { path = "../alloyvnc-screen-dxgi" }
+
+# The Linux capture and input backend, which carries the whole of the
+# X11 dependency and is absent everywhere else.
+[target.'cfg(target_os = "linux")'.dependencies]
+alloyvnc-screen-x11 = { path = "../alloyvnc-screen-x11" }
