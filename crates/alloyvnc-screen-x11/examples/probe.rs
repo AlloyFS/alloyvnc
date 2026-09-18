@@ -86,7 +86,9 @@ fn main() {
     // blaming anything else.
     let data = fb.data();
     let black = data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[0] == 0 && px[1] == 0 && px[2] == 0)
         .count();
     let total = data.len() / 4;
