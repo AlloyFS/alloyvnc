@@ -339,12 +339,15 @@ Things measured or observed that changed the plan, newest last.
   is not met by DXGI metadata alone.
 - **2026-09-18, DuplicateOutput is refused now and then on this laptop.**
   E_ACCESSDENIED from a healthy desktop, five times in four minutes, then
-  success with nothing changed. RealVNC Server runs here as SYSTEM with a
-  live session from the phone, and a more privileged process holding the
-  desktop image is what that error means; not proven, since both were
-  running during the successful runs too. The start retries five times,
-  400 ms apart. RealVNC also owns port 5900 on every interface, which is
-  why the tests and the rig use 5901.
+  success with nothing changed. Two VNC servers run on this laptop as
+  services: TightVNC Server, which listens on 5900 on every interface, and
+  RealVNC Server, which connects through RealVNC's own cloud side. A more
+  privileged process holding the desktop image is what that error means,
+  and either could be the holder; not proven, since both were running
+  during the successful runs too, and a later refusal came with no RealVNC
+  client connected at all. The start retries five times, 400 ms apart.
+  TightVNC on 5900 is why the tests and the rig use 5901, and it is the
+  phase 3 baseline, already installed.
 - **2026-09-18, phase 1 numbers.** Release build, adjacent runs, this
   laptop, the desktop busy (this app redrawing), noVNC in a hidden tab, Raw
   only: 2.0% of one core and 30.8 MB with no client; 4.7% and 38.8 MB with

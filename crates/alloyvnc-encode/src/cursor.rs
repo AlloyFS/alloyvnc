@@ -58,7 +58,7 @@ pub fn encode_cursor(shape: &CursorShape, pf: &PixelFormat, out: &mut Vec<u8>) {
     let mut row = Vec::with_capacity(w * 4);
     for line in shape.rgba.chunks_exact(w * 4) {
         row.clear();
-        for px in line.chunks_exact(4) {
+        for px in line.as_chunks::<4>().0 {
             row.extend_from_slice(&[px[2], px[1], px[0], 0]);
         }
         convert_row(&row, pf, out);
@@ -67,7 +67,7 @@ pub fn encode_cursor(shape: &CursorShape, pf: &PixelFormat, out: &mut Vec<u8>) {
     for line in shape.rgba.chunks_exact(w * 4) {
         let start = out.len();
         out.resize(start + mask_stride, 0);
-        for (x, px) in line.chunks_exact(4).enumerate() {
+        for (x, px) in line.as_chunks::<4>().0.iter().enumerate() {
             if px[3] >= 128 {
                 out[start + x / 8] |= 0x80 >> (x % 8);
             }

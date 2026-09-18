@@ -171,8 +171,10 @@ pub fn parse_client(buf: &[u8]) -> Result<Option<(ClientMessage, usize)>, Error>
             }
             let raw = need!(c.take(n * 4));
             let list = raw
-                .chunks_exact(4)
-                .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| i32::from_be_bytes(*b))
                 .collect();
             ClientMessage::SetEncodings(list)
         }
@@ -476,7 +478,9 @@ pub fn parse_extended_desktop_size(buf: &[u8]) -> Result<Option<(Vec<Screen>, us
         return Ok(None);
     }
     let screens = buf[4..total]
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|b| Screen {
             id: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
             x: u16::from_be_bytes([b[4], b[5]]),

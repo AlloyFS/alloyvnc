@@ -63,7 +63,9 @@ pub fn convert_row(src: &[u8], pf: &PixelFormat, out: &mut Vec<u8>) {
         return;
     }
     let packer = Packer::new(pf);
-    let pixels = src.chunks_exact(4);
+    // Whole pixels only: `as_chunks` hands back arrays of four, so every
+    // index into a pixel below is checked once here rather than per pixel.
+    let pixels = src.as_chunks::<4>().0.iter();
     out.reserve(pixels.len() * pf.bytes_per_pixel());
     match (pf.bits_per_pixel, pf.big_endian) {
         (8, _) => out.extend(pixels.map(|px| packer.pack(px) as u8)),

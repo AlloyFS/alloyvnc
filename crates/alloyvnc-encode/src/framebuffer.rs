@@ -87,9 +87,10 @@ impl Framebuffer {
         for y in r.y1..r.y2 {
             for dst in self
                 .row_span_mut(y as u32, r.x1 as u32, r.width() as u32)
-                .chunks_exact_mut(4)
+                .as_chunks_mut::<4>()
+                .0
             {
-                dst.copy_from_slice(&px);
+                *dst = px;
             }
         }
     }
