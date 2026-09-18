@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 
+use alloyvnc_encode::decode::{self, DecodeError, TightReader, ZrleReader};
 use alloyvnc_encode::{CursorShape, Framebuffer};
 use alloyvnc_proto::handshake::{self, Flow, ServerInit, security};
 use alloyvnc_proto::msg::{self, Screen, server_type};
@@ -23,7 +24,6 @@ pub struct Received {
     pub encoding: i32,
 }
 
-#[derive(Debug)]
 pub struct Client {
     stream: TcpStream,
     /// The picture as decoded so far.
@@ -51,6 +51,29 @@ pub struct Client {
     /// Every server message's type byte, in the order it arrived. What a
     /// test needs to say "and nothing came between these two".
     pub order: Vec<u8>,
+    /// The format the server is sending in. The test client never asks for
+    /// anything but the framebuffer's own, but the decoders take it, so it
+    /// is kept rather than assumed twice.
+    pub pf: PixelFormat,
+    /// One rectangle's payload, read ahead of the decoder that wants it.
+    payload: Vec<u8>,
+    /// The stream decoders, which live as long as the connection because
+    /// the server's compressors do.
+    zrle: ZrleReader,
+    tight: TightReader,
+}
+
+/// Written by hand rather than derived: the two stream decoders hold zlib
+/// state, which has no Debug of its own and nothing anyone wants to read.
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("name", &self.name)
+            .field("size", &(self.fb.width(), self.fb.height()))
+            .field("pings", &self.pings)
+            .field("fences", &self.fences.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
@@ -125,6 +148,10 @@ impl Client {
             screens: Vec::new(),
             resizes: Vec::new(),
             order: Vec::new(),
+            pf: PixelFormat::bgrx32(),
+            payload: Vec::new(),
+            zrle: ZrleReader::new(),
+            tight: TightReader::new(),
         })
     }
 
@@ -265,6 +292,59 @@ impl Client {
                                     self.fb.resize(w, h);
                                 }
                             }
+                            encoding::HEXTILE => {
+                                // Hextile describes its own length only by
+                                // being read, so the payload grows until the
+                                // decoder stops asking. Nothing it does is
+                                // stateful, so starting again with more
+                                // bytes costs only the work.
+                                self.payload.clear();
+                                loop {
+                                    match decode::hextile(&self.payload, rect, &self.pf, &mut self.fb) {
+                                        Ok(_) => break,
+                                        Err(DecodeError::Truncated(more)) => {
+                                            self.read_more(more.max(1)).await?
+                                        }
+                                        Err(e) => bail!("hextile: {e}"),
+                                    }
+                                }
+                            }
+                            encoding::ZRLE => {
+                                // A length, then that many bytes, and only
+                                // then the inflater: feeding a zlib stream
+                                // half a block ruins every rectangle after.
+                                self.payload.clear();
+                                self.read_more(4).await?;
+                                let length =
+                                    u32::from_be_bytes(self.payload[..4].try_into().expect("four bytes"))
+                                        as usize;
+                                self.read_more(length).await?;
+                                self.zrle
+                                    .decode(&self.payload, rect, &self.pf, &mut self.fb)
+                                    .with_context(|| format!("zrle {rect:?}"))?;
+                            }
+                            encoding::TIGHT => {
+                                // The header says how long the piece is, and
+                                // reading it touches no stream, so it is safe
+                                // to try on a payload still arriving.
+                                self.payload.clear();
+                                let need = loop {
+                                    match TightReader::payload_len(&self.payload, rect, &self.pf) {
+                                        Ok(n) => break n,
+                                        Err(DecodeError::Truncated(more)) => {
+                                            self.read_more(more.max(1)).await?
+                                        }
+                                        Err(e) => bail!("tight header: {e}"),
+                                    }
+                                };
+                                if self.payload.len() < need {
+                                    let more = need - self.payload.len();
+                                    self.read_more(more).await?;
+                                }
+                                self.tight
+                                    .decode(&self.payload[..need], rect, &self.pf, &mut self.fb)
+                                    .with_context(|| format!("tight {rect:?}"))?;
+                            }
                             encoding::PSEUDO_LAST_RECT => break,
                             other => bail!(
                                 "encoding {other} ({}) not decoded by the test client",
@@ -307,6 +387,17 @@ impl Client {
                 other => bail!("server message type {other} not handled by the test client"),
             }
         }
+    }
+
+    /// Append `n` more bytes of the current rectangle's payload.
+    async fn read_more(&mut self, n: usize) -> Result<()> {
+        let at = self.payload.len();
+        self.payload.resize(at + n, 0);
+        self.stream
+            .read_exact(&mut self.payload[at..])
+            .await
+            .context("rectangle payload")?;
+        Ok(())
     }
 
     /// Answer one fence: the same payload, the same flags without the

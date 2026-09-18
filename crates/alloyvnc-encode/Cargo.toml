@@ -15,3 +15,7 @@ alloyvnc-region.workspace = true
 # xxh3 is the fast half of xxhash: a few cycles a byte, which is what
 # makes hashing every damaged pixel cheaper than comparing them.
 xxhash-rust.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
+jpeg-encoder.workspace = true
+zune-jpeg.workspace = true

@@ -5,6 +5,20 @@
 //! asks for exactly the framebuffer's layout, and [`convert_row`] answers with
 //! a copy. The other layouts go through one loop shaped so the compiler can
 //! vectorise it; hand-written SIMD waits for a profile that asks for it.
+//!
+//! There was going to be a third path here, a byte shuffle for the 32-bit
+//! layouts that are the framebuffer's own bytes in another order, which is
+//! what noVNC asks for. Measured on a 1080p frame, it has nothing to win:
+//! shuffled and packed both run at 2.45 GB/s, and a straight copy of the
+//! same bytes runs at 5.1, which is the same memory bandwidth once both
+//! directions are counted. The packer is already going as fast as the
+//! memory will carry it and its arithmetic is free. Put behind a dispatch
+//! rather than inlined, the shuffle was half as fast again, which is the
+//! other half of the lesson. `examples/convert-bench.rs` keeps all of it
+//! side by side.
+//!
+//! What would repay attention is the narrow formats: rgb565 manages 0.83
+//! GB/s, a third of the rate, because every pixel is scaled.
 
 use alloyvnc_proto::PixelFormat;
 

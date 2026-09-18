@@ -430,3 +430,46 @@ Things measured or observed that changed the plan, newest last.
   base of 1.0, window 868 KB, and from frame to socket 319 updates under a
   millisecond, 57 between 10 and 20 ms (the 60 Hz ceiling's slot) and none
   over 20.
+- **2026-09-18, the encoders, measured.** Release, 300 frames of the
+  1280x720 synthetic screen, `cargo run --release -p alloyvnc --example
+  encoders`. On the screen's exact damage (5.6 M pixels), in the
+  framebuffer's own format: Raw 22.5 MB in 3.4 ms; Hextile 2.5% of Raw in
+  0.26 ms a frame; Tight 1.4% in 0.46 ms; ZRLE 1.1% in 2.8 ms. On coarse
+  damage, the whole-window rectangles the real backends report (49 times
+  the pixels): Tight 0.7% of Raw at 22 ms a frame, ZRLE 0.5% at 21.5 ms,
+  Hextile 1.1% at 15 ms. Four conclusions. ZRLE is the smallest and not
+  worth it: a fifth fewer bytes than Tight for six times the CPU, so
+  section 9's "never ZRLE by default" is a number now. The compare pass is
+  worth more than the encoder: coarse damage costs Tight 25 times the bytes
+  and 49 times the time of exact damage. The pixel format matters only to
+  Raw (a copy at 3.4 ms in BGRX, 32 ms through the packer in RGBX); the
+  other encoders' own work dominates. And on this screen Tight never took
+  the JPEG it was offered at quality 6: every piece fit a palette, which
+  is smaller and lossless, so JPEG is proved on a gradient in the tests
+  (four times smaller, worst channel 24 off) and the synthetic screen
+  needs a photographic scenario before the quality levels can be measured.
+- **2026-09-18, two things measured and left out.** A 32-bit byte-order
+  fast path for noVNC's RGBX: the generic packer and a byte shuffle both
+  run at 2.45 GB/s on a 1080p frame against a plain copy's 5.1, so the
+  packer already runs at the memory's pace and a shuffle has nothing to
+  win (behind a dispatch it was half as fast again); the narrow formats
+  are where conversion time goes, rgb565 at 0.83 GB/s.
+  `examples/convert-bench.rs` keeps the four formulations rerunnable.
+  And libjpeg-turbo: it cannot build here, cmake and nasm being absent,
+  so the JPEG encoder is the pure-Rust one behind a single function
+  taking RGB rows, a level and a subsampling; the swap is one file when
+  a build has the tools.
+- **2026-09-18, Tight to the browser on the real desktop.** noVNC in a
+  hidden rig tab (it asks for Tight at quality 6, compression 2), release,
+  24 s once connected, the desktop busy with two sessions' output: 988
+  updates, 11,773 rectangles, 31 of them CopyRect, 4.90 MB in all, 5 KB an
+  update against 25 KB for phase 2b's Raw run on the same desktop. Where
+  the bytes went: palette 2.69 MB, full-colour deflate 1.45 MB, JPEG
+  0.61 MB, fill 16 bytes. The hidden tab answered pings at 32 ms smoothed
+  against a base of 1.2, so the window sat at 180 KB; frame to socket 373
+  updates under a millisecond and 292 between 10 and 20 ms, the 60 Hz slot.
+  The TightVNC Server on 5900 is the baseline to put beside this; it needs
+  Kyle's viewer and his password, so the byte-counting proxy at
+  `C:\Users\Kyle\.claude\chrome\bench\count-proxy.py` is his to run:
+  `python count-proxy.py 5902 127.0.0.1:5900`, the viewer pointed at 5902,
+  and the same again at 5901 with alloyvnc serving.

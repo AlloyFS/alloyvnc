@@ -582,3 +582,157 @@ async fn fetch(addr: std::net::SocketAddr, request: &str) -> String {
     stream.read_to_end(&mut out).await.unwrap();
     String::from_utf8(out).expect("the document is text")
 }
+
+/// The encoders, end to end: whatever a client asks for, the picture it ends
+/// up with is the picture the server has.
+#[tokio::test]
+async fn every_lossless_encoding_reproduces_the_picture() {
+    for (name, encoding) in [
+        ("Tight", encoding::TIGHT),
+        ("ZRLE", encoding::ZRLE),
+        ("Hextile", encoding::HEXTILE),
+        ("Raw", encoding::RAW),
+    ] {
+        let rig = Rig::start(None).await;
+        rig.frames(1).await;
+        let mut c = Client::connect(rig.addr, None).await.unwrap();
+        let mut list = vec![encoding];
+        list.extend_from_slice(ALL);
+        c.set_encodings(&list).await.unwrap();
+        c.request_all(false).await.unwrap();
+        c.next_update().await.unwrap();
+        assert_eq!(c.fb.data(), rig.picture(), "{name}: the first update");
+
+        for frame in 0..20 {
+            rig.frames(1).await;
+            c.request_all(true).await.unwrap();
+            c.next_update().await.unwrap();
+            assert_eq!(c.fb.data(), rig.picture(), "{name}: after frame {frame}");
+        }
+
+        // And it really did use what it was asked for.
+        let doc = alloyvnc::stats::document(&rig.shared);
+        let field = match encoding {
+            encoding::TIGHT => "\"tight\":",
+            encoding::ZRLE => "\"zrle\":",
+            encoding::HEXTILE => "\"hextile\":",
+            _ => "\"raw\":",
+        };
+        let spent: u64 = doc
+            .split(field)
+            .nth(1)
+            .and_then(|rest| rest.split([',', '}']).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        assert!(spent > 0, "{name} sent nothing through its own encoding: {doc}");
+    }
+}
+
+/// A client that says it will take JPEG gets one for the busy parts, and the
+/// picture it ends up with is the picture within what JPEG gives back.
+#[tokio::test]
+async fn a_quality_level_sends_jpeg_and_the_picture_survives_it() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    let mut list = vec![encoding::TIGHT, encoding::TIGHT_QUALITY_BASE + 6];
+    list.extend_from_slice(ALL);
+    c.set_encodings(&list).await.unwrap();
+
+    // The synthetic screen is drawn from a handful of colours, so a palette
+    // beats JPEG on every piece of it and JPEG never gets a look in. A
+    // gradient is what JPEG is for: no two pixels alike, and nothing for a
+    // palette or a run to hold on to. It is painted straight into the shared
+    // picture, and no frame is drawn after it, so it is what the update
+    // carries.
+    {
+        let mut fb = rig.shared.fb.write();
+        for y in 0..fb.height() {
+            for x in 0..fb.width() {
+                // Smooth in every channel: a wrap would be a hard edge,
+                // and JPEG rings around those rather than blurring them.
+                let (w, h) = (fb.width().max(1), fb.height().max(1));
+                let v = [
+                    (x * 255 / w) as u8,
+                    (y * 255 / h) as u8,
+                    ((x + y) * 255 / (w + h)) as u8,
+                    0,
+                ];
+                fb.put_pixel(x, y, v);
+            }
+        }
+    }
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+
+    let doc = alloyvnc::stats::document(&rig.shared);
+    let jpeg: u64 = doc
+        .split("\"tight_jpeg\":")
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}']).next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(jpeg > 0, "the noisy band went as JPEG: {doc}");
+
+    // Lossy, so the check is how far off rather than whether.
+    let server = rig.picture();
+    let client = c.fb.data();
+    assert_eq!(server.len(), client.len());
+    let worst = server
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(client.as_chunks::<4>().0)
+        .map(|(a, b)| (0..3).map(|i| a[i].abs_diff(b[i])).max().unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        worst <= 40,
+        "the worst channel is {worst} off after a JPEG round trip"
+    );
+}
+
+/// The client's list is an order of preference, not a set.
+#[tokio::test]
+async fn the_clients_own_order_decides_the_encoding() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+
+    // Hextile named before Tight, so Hextile it is, even though the server
+    // would rather send Tight.
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.set_encodings(&[encoding::HEXTILE, encoding::TIGHT, encoding::RAW])
+        .await
+        .unwrap();
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+    assert_eq!(c.fb.data(), rig.picture());
+
+    let doc = alloyvnc::stats::document(&rig.shared);
+    let spent = |field: &str| -> u64 {
+        doc.split(field)
+            .nth(1)
+            .and_then(|rest| rest.split([',', '}']).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    assert!(spent("\"hextile\":") > 0, "{doc}");
+    assert_eq!(spent("\"tight\":"), 0, "{doc}");
+
+    // And saying something different later changes it, streams and all.
+    c.set_encodings(&[encoding::TIGHT, encoding::HEXTILE, encoding::RAW])
+        .await
+        .unwrap();
+    rig.frames(1).await;
+    c.request_all(true).await.unwrap();
+    c.next_update().await.unwrap();
+    assert_eq!(c.fb.data(), rig.picture(), "after changing its mind");
+    let doc = alloyvnc::stats::document(&rig.shared);
+    let tight: u64 = doc
+        .split("\"tight\":")
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}']).next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    assert!(tight > 0, "{doc}");
+}

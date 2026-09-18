@@ -11,9 +11,17 @@ pub mod compare;
 pub mod convert;
 pub mod copyrect;
 pub mod cursor;
+pub mod decode;
+pub mod hextile;
+pub mod jpeg;
 pub mod raw;
+pub mod tight;
+pub mod zrle;
 
 mod framebuffer;
+
+#[cfg(test)]
+mod testing;
 
 pub use alloyvnc_proto::PixelFormat;
 pub use alloyvnc_region::Rect;

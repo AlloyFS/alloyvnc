@@ -95,6 +95,17 @@ pub struct SessionStats {
     pub window: AtomicU64,
     pub pings_outstanding: AtomicU64,
     pub latency: Latency,
+    /// Where the bytes went, by encoding. A run that says "eleven megabytes"
+    /// is not as useful as one that says which encoding spent them.
+    pub bytes_raw: AtomicU64,
+    pub bytes_copy_rect: AtomicU64,
+    pub bytes_hextile: AtomicU64,
+    pub bytes_zrle: AtomicU64,
+    pub bytes_tight: AtomicU64,
+    pub tight_fill: AtomicU64,
+    pub tight_palette: AtomicU64,
+    pub tight_jpeg: AtomicU64,
+    pub tight_copy: AtomicU64,
 }
 
 impl SessionStats {
@@ -112,6 +123,15 @@ impl SessionStats {
             window: AtomicU64::new(0),
             pings_outstanding: AtomicU64::new(0),
             latency: Latency::default(),
+            bytes_raw: AtomicU64::new(0),
+            bytes_copy_rect: AtomicU64::new(0),
+            bytes_hextile: AtomicU64::new(0),
+            bytes_zrle: AtomicU64::new(0),
+            bytes_tight: AtomicU64::new(0),
+            tight_fill: AtomicU64::new(0),
+            tight_palette: AtomicU64::new(0),
+            tight_jpeg: AtomicU64::new(0),
+            tight_copy: AtomicU64::new(0),
         })
     }
 
@@ -135,6 +155,20 @@ impl SessionStats {
             self.pings_outstanding.load(Ordering::Relaxed),
         );
         self.latency.write(out);
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let _ = write!(
+            out,
+            ",\"encodings\":{{\"raw\":{},\"copy_rect\":{},\"hextile\":{},\"zrle\":{},\"tight\":{},\"tight_fill\":{},\"tight_palette\":{},\"tight_jpeg\":{},\"tight_copy\":{}}}",
+            load(&self.bytes_raw),
+            load(&self.bytes_copy_rect),
+            load(&self.bytes_hextile),
+            load(&self.bytes_zrle),
+            load(&self.bytes_tight),
+            load(&self.tight_fill),
+            load(&self.tight_palette),
+            load(&self.tight_jpeg),
+            load(&self.tight_copy),
+        );
         out.push('}');
     }
 }
@@ -297,7 +331,7 @@ mod tests {
         );
         assert!(out.contains("\"rtt_ms\":12.500"), "{out}");
         assert!(out.contains("\"window\":65536"), "{out}");
-        assert!(out.ends_with("\"over\":0}}"), "{out}");
+        assert!(out.contains("\"encodings\":{"), "{out}");
         // Balanced braces, which is as much of a parser as this needs.
         assert_eq!(out.matches('{').count(), out.matches('}').count());
     }

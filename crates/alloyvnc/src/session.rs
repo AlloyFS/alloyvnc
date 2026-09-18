@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use alloyvnc_encode::hextile::Hextile;
+use alloyvnc_encode::tight::{Spent, Tight};
+use alloyvnc_encode::zrle::Zrle;
 use alloyvnc_encode::{CursorShape, copyrect, cursor, raw};
 use alloyvnc_proto::handshake::{self, Flow, ServerInit, security};
 use alloyvnc_proto::msg::{self, ClientMessage, Screen, resize_reason, resize_status};
@@ -122,6 +125,12 @@ pub async fn run(
         held_fence: None,
         reader_paused: false,
         newest_frame: None,
+        coder: Coder::Raw,
+        choice: Choice {
+            encoding: encoding::RAW,
+            level: DEFAULT_LEVEL,
+            quality: None,
+        },
         stats,
     };
     let outcome = session.serve(rd).await;
@@ -217,6 +226,70 @@ async fn authenticate(stream: &mut TcpStream, flow: Flow, cfg: &SessionConfig) -
     Ok(())
 }
 
+/// What a client's rectangles are encoded with, and the state that goes
+/// with it.
+///
+/// Raw needs nothing kept; the other three keep zlib streams, palettes and
+/// the rest for the life of the session, because a client's decoder mirrors
+/// them. Changing encoder means building a new one, which is also what
+/// starts the streams again.
+enum Coder {
+    Raw,
+    Hextile(Box<Hextile>),
+    Zrle(Box<Zrle>),
+    Tight(Box<Tight>),
+}
+
+/// How a client wants its pixels, as its encoding list describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Choice {
+    encoding: i32,
+    /// Deflate level, clamped: level 6 is three times the work of level 1
+    /// for a tenth fewer bytes, which is a bad trade on a two-core laptop.
+    level: u32,
+    /// JPEG quality 0 to 9, or none, in which case nothing is lossy.
+    quality: Option<u8>,
+}
+
+impl Choice {
+    /// The first encoding the client named that this server can write, in
+    /// the client's own order of preference.
+    fn read(list: &[i32]) -> Choice {
+        let encoding = list
+            .iter()
+            .copied()
+            .find(|e| {
+                matches!(
+                    *e,
+                    encoding::TIGHT | encoding::ZRLE | encoding::HEXTILE | encoding::RAW
+                )
+            })
+            .unwrap_or(encoding::RAW);
+        let quality = list.iter().find_map(|e| encoding::tight_quality(*e));
+        let level = list
+            .iter()
+            .find_map(|e| encoding::tight_compression(*e))
+            .map_or(DEFAULT_LEVEL, |l| u32::from(l).clamp(1, 6));
+        Choice {
+            encoding,
+            level,
+            quality,
+        }
+    }
+
+    fn build(&self) -> Coder {
+        match self.encoding {
+            encoding::TIGHT => Coder::Tight(Box::new(Tight::new(self.level, self.quality))),
+            encoding::ZRLE => Coder::Zrle(Box::new(Zrle::new(self.level))),
+            encoding::HEXTILE => Coder::Hextile(Box::new(Hextile::new())),
+            _ => Coder::Raw,
+        }
+    }
+}
+
+/// Where deflate sits unless the client asks otherwise.
+const DEFAULT_LEVEL: u32 = 1;
+
 /// A viewer that vanished mid-session (its window closed, its network
 /// dropped) is the ordinary way a session ends, not a fault to warn about.
 fn is_gone(e: &anyhow::Error) -> bool {
@@ -273,6 +346,9 @@ struct Session {
     /// When the newest frame folded into `pending` was captured, so an
     /// update can say how old the freshest thing in it is.
     newest_frame: Option<Instant>,
+    /// How this client's rectangles are encoded, and what it asked for.
+    coder: Coder,
+    choice: Choice,
     stats: Arc<SessionStats>,
 }
 
@@ -525,7 +601,13 @@ impl Session {
                 pf.validate()
                     .with_context(|| format!("client asked for {pf:?}"))?;
                 tracing::debug!(peer = %self.peer, ?pf, "pixel format");
-                self.pf = pf;
+                if pf != self.pf {
+                    // Every stream's history is pixels in the old format,
+                    // which is no help compressing the new one and would
+                    // put the client's decoder out of step.
+                    self.pf = pf;
+                    self.coder = self.choice.build();
+                }
             }
             ClientMessage::SetEncodings(list) => {
                 let names: Vec<&str> = list.iter().map(|&e| encoding::name(e)).collect();
@@ -550,6 +632,22 @@ impl Session {
                     self.layout_pending = true;
                 }
                 self.encodings = list;
+                // A client may say this more than once, and a different
+                // answer means different streams: the old ones are thrown
+                // away rather than carried into an encoding that cannot use
+                // them.
+                let choice = Choice::read(&self.encodings);
+                if choice != self.choice {
+                    tracing::debug!(
+                        peer = %self.peer,
+                        encoding = encoding::name(choice.encoding),
+                        level = choice.level,
+                        quality = ?choice.quality,
+                        "encoder"
+                    );
+                    self.choice = choice;
+                    self.coder = choice.build();
+                }
                 if self.cursor_pending.is_none() && self.cursor_encoding().is_some() {
                     // A client that arrived after the last shape change
                     // still needs the pointer as it is now.
@@ -743,7 +841,13 @@ impl Session {
         } else {
             damage.rects().to_vec()
         };
-        let n = usize::from(layout) + usize::from(cursor.is_some()) + sendable.len() + damage_rects.len();
+        // Tight has a ceiling on how big one rectangle may be, so a large
+        // one becomes several on the wire and the count has to say so.
+        let encode_rects: Vec<Rect> = match self.coder {
+            Coder::Tight(_) => damage_rects.iter().flat_map(|r| Tight::piece_rects(*r)).collect(),
+            _ => damage_rects.clone(),
+        };
+        let n = usize::from(layout) + usize::from(cursor.is_some()) + sendable.len() + encode_rects.len();
         msg::write_framebuffer_update_header(&mut self.out, u16::try_from(n).context("rectangle count")?);
 
         if layout {
@@ -778,6 +882,7 @@ impl Session {
             }
             self.stats.cursor_rects.fetch_add(1, Ordering::Relaxed);
         }
+        let copy_at = self.out.len();
         for m in &sendable {
             msg::write_rect_header(
                 &mut self.out,
@@ -792,19 +897,51 @@ impl Session {
         self.stats
             .copy_rects
             .fetch_add(sendable.len() as u64, Ordering::Relaxed);
+        self.stats
+            .bytes_copy_rect
+            .fetch_add((self.out.len() - copy_at) as u64, Ordering::Relaxed);
         {
             let fb = self.shared.fb.read();
-            for r in &damage_rects {
+            let mut spent = Spent::default();
+            for r in &encode_rects {
+                let at = self.out.len();
                 msg::write_rect_header(
                     &mut self.out,
                     r.x1 as u16,
                     r.y1 as u16,
                     r.width() as u16,
                     r.height() as u16,
-                    encoding::RAW,
+                    self.choice.encoding,
                 );
-                raw::encode(&fb, *r, &self.pf, &mut self.out);
+                match &mut self.coder {
+                    Coder::Raw => raw::encode(&fb, *r, &self.pf, &mut self.out),
+                    Coder::Hextile(h) => h.encode(&fb, *r, &self.pf, &mut self.out),
+                    Coder::Zrle(z) => z.encode(&fb, *r, &self.pf, &mut self.out),
+                    Coder::Tight(t) => {
+                        let piece = t.encode(&fb, *r, &self.pf, &mut self.out);
+                        spent = Spent {
+                            fill: spent.fill + piece.fill,
+                            palette: spent.palette + piece.palette,
+                            jpeg: spent.jpeg + piece.jpeg,
+                            copy: spent.copy + piece.copy,
+                        };
+                    }
+                }
+                let bytes = (self.out.len() - at) as u64;
+                let counter = match self.choice.encoding {
+                    encoding::TIGHT => &self.stats.bytes_tight,
+                    encoding::ZRLE => &self.stats.bytes_zrle,
+                    encoding::HEXTILE => &self.stats.bytes_hextile,
+                    _ => &self.stats.bytes_raw,
+                };
+                counter.fetch_add(bytes, Ordering::Relaxed);
             }
+            self.stats.tight_fill.fetch_add(spent.fill, Ordering::Relaxed);
+            self.stats
+                .tight_palette
+                .fetch_add(spent.palette, Ordering::Relaxed);
+            self.stats.tight_jpeg.fetch_add(spent.jpeg, Ordering::Relaxed);
+            self.stats.tight_copy.fetch_add(spent.copy, Ordering::Relaxed);
         }
         self.pending = self.pending.subtract(&damage);
         self.requested = None;
