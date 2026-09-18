@@ -398,3 +398,35 @@ Things measured or observed that changed the plan, newest last.
   is verified cell against cell, so a wrong guess can only copy pixels that
   were going to be sent anyway. Horizontal scrolls and two panes scrolling
   by different amounts are not detected; the backlog has both.
+- **2026-09-18, the compare pass costs 39% on a backend that tells the
+  truth.** The synthetic screen reports exact rectangles and its own moves;
+  the pass rounds everything to 64-pixel cells, so its damage came out at
+  1.39 times what was reported (15.1 M reported, 20.9 M after, over a 30 s
+  run). The cell grid is the price of not keeping the previous frame: a
+  bargain against a backend that reports a whole window, a loss against one
+  that reports the truth, and the synthetic screen is the only one that
+  does. Noticing an exact backend and stepping aside is on the backlog.
+- **2026-09-18, flow control, measured.** Release, adjacent. In process
+  (`cargo run --release -p alloyvnc --example pace`), the synthetic screen
+  at 30 fps for 30 s: a client reading as fast as it can took 902 updates
+  (30.0 a second), rtt 0.48 ms against a base of 0.33, window grown to
+  3.7 MB, 83.5 MB in all, 901 of 902 updates under a millisecond from frame
+  to socket. A client pausing 300 ms between reads, while the screen drew
+  904 frames, took 97 updates and 51.3 MB: the 800 it could not read
+  folded into the ones it did, the window settled at 455 KB against a
+  300 ms round trip, and nothing in its histogram was over 100 ms; without
+  the window those updates would have aged in a send buffer. The window
+  opens 4 KiB an ack, so the fast client needed all 901 acks and the whole
+  30 s to reach 3.7 MB; a slow-start phase is on the backlog.
+- **2026-09-18, the browser on both screens, with the stats endpoint.**
+  noVNC through websockify in a hidden rig tab, release. Synthetic screen
+  at 30 fps, 20 s: 267 updates, one CopyRect in each (the band's scroll),
+  37.8 MB, base rtt 2.3 ms but 55 ms smoothed, so the window stayed at
+  64 KB and held the tab to 13 updates a second: a hidden tab answers
+  slowly, and the window read that as the queue it is. The real desktop,
+  busy, 24 s: 1481 frames captured of which 729 changed no pixel, 34.3 M
+  pixels reported and 5.45 M after (0.16), 457 updates and 11.45 MB to the
+  browser (phase 1's Raw run moved 190 MB in 22 s), rtt 2.6 ms against a
+  base of 1.0, window 868 KB, and from frame to socket 319 updates under a
+  millisecond, 57 between 10 and 20 ms (the 60 Hz ceiling's slot) and none
+  over 20.

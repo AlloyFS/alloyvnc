@@ -2,10 +2,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use alloyvnc_encode::{CursorShape, Framebuffer};
 use alloyvnc_region::{Move, Rect, Region};
 use alloyvnc_screen::Input;
+
+use crate::stats::{CaptureStats, SessionStats};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::broadcast;
 
@@ -15,6 +18,11 @@ use tokio::sync::broadcast;
 #[derive(Clone, Debug)]
 pub struct FrameEvent {
     pub seq: u64,
+    /// When the capture thread finished writing this frame. A session
+    /// subtracts it from the clock as an update goes out, which is the
+    /// "capture to socket" number the plan asks for: everything the server
+    /// adds between a pixel changing and the bytes leaving.
+    pub at: Instant,
     pub damage: Arc<Region>,
     pub moves: Arc<Vec<Move>>,
     pub cursor: Option<Arc<CursorShape>>,
@@ -36,6 +44,11 @@ pub struct Shared {
     /// Frames applied so far.
     pub seq: AtomicU64,
     pub input: Mutex<Box<dyn Input>>,
+    /// Every live session's counters, for the stats endpoint. Holding a
+    /// second reference rather than reaching into the session means reading
+    /// them never waits on whatever that session is doing.
+    pub sessions: Mutex<Vec<Arc<SessionStats>>>,
+    pub capture: CaptureStats,
 }
 
 impl Shared {
@@ -53,7 +66,17 @@ impl Shared {
             frames,
             seq: AtomicU64::new(0),
             input: Mutex::new(input),
+            sessions: Mutex::new(Vec::new()),
+            capture: CaptureStats::default(),
         })
+    }
+
+    pub fn register(&self, stats: Arc<SessionStats>) {
+        self.sessions.lock().push(stats);
+    }
+
+    pub fn unregister(&self, stats: &Arc<SessionStats>) {
+        self.sessions.lock().retain(|s| !Arc::ptr_eq(s, stats));
     }
 
     pub fn seq(&self) -> u64 {

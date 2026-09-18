@@ -30,8 +30,17 @@ pub struct Client {
     pub fb: Framebuffer,
     pub name: String,
     pub last_cut_text: Option<String>,
-    /// Fences the server answered, newest last.
+    /// Fences the server sent, newest last.
     pub fences: Vec<(u32, Vec<u8>)>,
+    /// Fences the server asked to have echoed, which is how it measures the
+    /// link. A real viewer answers each one as soon as it has finished with
+    /// everything in front of it.
+    pub pings: u64,
+    /// Hold the answers instead of sending them, which is how a test plays
+    /// a client that has stopped keeping up: the server's window fills and
+    /// it stops building updates.
+    pub hold_fences: bool,
+    held: Vec<(u32, Vec<u8>)>,
     pub end_of_continuous_updates: u32,
     /// The pointer as last sent, hidden or not.
     pub cursor: Option<CursorShape>,
@@ -39,6 +48,9 @@ pub struct Client {
     pub screens: Vec<Screen>,
     /// Resizes seen, with the reason and status fields.
     pub resizes: Vec<(u16, u16)>,
+    /// Every server message's type byte, in the order it arrived. What a
+    /// test needs to say "and nothing came between these two".
+    pub order: Vec<u8>,
 }
 
 impl Client {
@@ -105,10 +117,14 @@ impl Client {
             name: init.name,
             last_cut_text: None,
             fences: Vec::new(),
+            pings: 0,
+            hold_fences: false,
+            held: Vec::new(),
             end_of_continuous_updates: 0,
             cursor: None,
             screens: Vec::new(),
             resizes: Vec::new(),
+            order: Vec::new(),
         })
     }
 
@@ -180,6 +196,7 @@ impl Client {
     pub async fn next_update(&mut self) -> Result<Vec<Received>> {
         loop {
             let kind = self.stream.read_u8().await.context("server message")?;
+            self.order.push(kind);
             match kind {
                 server_type::FRAMEBUFFER_UPDATE => {
                     self.stream.read_u8().await?;
@@ -214,7 +231,7 @@ impl Client {
                                 self.stream.read_exact(&mut mask).await?;
                                 let stride = (w as usize).div_ceil(8);
                                 let mut rgba = Vec::with_capacity(pixels.len());
-                                for (i, px) in pixels.chunks_exact(4).enumerate() {
+                                for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate() {
                                     let (cx, cy) = (i % w as usize, i / w as usize);
                                     let on = mask[cy * stride + cx / 8] & (0x80 >> (cx % 8)) != 0;
                                     rgba.extend_from_slice(&[px[2], px[1], px[0], if on { 255 } else { 0 }]);
@@ -274,13 +291,46 @@ impl Client {
                     self.stream.read_exact(&mut pad).await?;
                     let flags = self.stream.read_u32().await?;
                     let len = usize::from(self.stream.read_u8().await?);
+                    ensure!(len <= msg::MAX_FENCE_PAYLOAD, "fence payload of {len} bytes");
                     let mut payload = vec![0u8; len];
                     self.stream.read_exact(&mut payload).await?;
-                    self.fences.push((flags, payload));
+                    self.fences.push((flags, payload.clone()));
+                    if flags & msg::FENCE_REQUEST != 0 {
+                        self.pings += 1;
+                        if self.hold_fences {
+                            self.held.push((flags, payload));
+                        } else {
+                            self.echo(flags, &payload).await?;
+                        }
+                    }
                 }
                 other => bail!("server message type {other} not handled by the test client"),
             }
         }
+    }
+
+    /// Answer one fence: the same payload, the same flags without the
+    /// request bit. A client that does not do this is telling the server
+    /// nothing, and the server's window shuts on it.
+    async fn echo(&mut self, flags: u32, payload: &[u8]) -> Result<()> {
+        let mut out = Vec::with_capacity(payload.len() + 12);
+        msg::write_client_fence(&mut out, flags & !msg::FENCE_REQUEST, payload);
+        self.stream.write_all(&out).await?;
+        Ok(())
+    }
+
+    /// Send every answer that was held back, oldest first.
+    pub async fn release_fences(&mut self) -> Result<usize> {
+        let held = std::mem::take(&mut self.held);
+        let n = held.len();
+        for (flags, payload) in held {
+            self.echo(flags, &payload).await?;
+        }
+        Ok(n)
+    }
+
+    pub fn held_fences(&self) -> usize {
+        self.held.len()
     }
 }
 

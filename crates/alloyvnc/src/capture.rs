@@ -79,6 +79,12 @@ pub fn spawn(shared: Arc<Shared>, mut capture: Box<dyn Capture>, stop: Arc<Atomi
                 };
                 if let Some((reported, tightened, moves, micros)) = pass {
                     tracing::trace!(reported, tightened, moves, micros, "compared");
+                    let c = &shared.capture;
+                    c.frames.fetch_add(1, Ordering::Relaxed);
+                    c.reported.fetch_add(reported as u64, Ordering::Relaxed);
+                    c.tightened.fetch_add(tightened as u64, Ordering::Relaxed);
+                    c.moves.fetch_add(moves as u64, Ordering::Relaxed);
+                    c.micros.fetch_add(micros, Ordering::Relaxed);
                     totals.frames += 1;
                     totals.reported += reported;
                     totals.tightened += tightened;
@@ -102,7 +108,10 @@ pub fn spawn(shared: Arc<Shared>, mut capture: Box<dyn Capture>, stop: Arc<Atomi
                     // Nothing of the picture actually differs: the backend
                     // said otherwise, and the pass is why no client hears
                     // about it.
-                    Ok(frame) if frame.is_empty() => totals.empty += 1,
+                    Ok(frame) if frame.is_empty() => {
+                        totals.empty += 1;
+                        shared.capture.empty.fetch_add(1, Ordering::Relaxed);
+                    }
                     Ok(frame) => {
                         if frame.resized {
                             let screens = capture.screens();
@@ -116,6 +125,7 @@ pub fn spawn(shared: Arc<Shared>, mut capture: Box<dyn Capture>, stop: Arc<Atomi
                         // No receivers is not an error: nobody is connected.
                         let _ = shared.frames.send(FrameEvent {
                             seq,
+                            at: Instant::now(),
                             damage: Arc::new(frame.damage),
                             moves: Arc::new(frame.moves),
                             cursor: frame.cursor,

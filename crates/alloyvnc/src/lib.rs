@@ -7,6 +7,8 @@
 
 pub mod capture;
 pub mod client;
+pub mod flow;
 pub mod server;
 pub mod session;
 pub mod shared;
+pub mod stats;

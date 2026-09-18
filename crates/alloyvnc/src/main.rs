@@ -62,6 +62,12 @@ struct ServeArgs {
     #[arg(long, default_value_t = 60)]
     max_fps: u32,
 
+    /// Serve the counters as JSON on this address. Off unless given, and
+    /// loopback unless --insecure: they say how busy the desk is and what
+    /// its screen costs to send.
+    #[arg(long)]
+    stats: Option<SocketAddr>,
+
     /// The X display to capture, as DISPLAY names it (":0", "host:1").
     #[cfg(target_os = "linux")]
     #[arg(long, env = "DISPLAY")]
@@ -135,9 +141,19 @@ async fn serve(args: ServeArgs) -> Result<()> {
         password: args.password,
         max_fps: args.max_fps,
         auth_fail_delay: Duration::from_secs(1),
+        flow: Default::default(),
     };
     let server = Server::bind(args.bind, session, shared.clone()).await?;
     tracing::info!(addr = %server.local_addr()?, width, height, "listening");
+
+    if let Some(addr) = args.stats {
+        if !addr.ip().is_loopback() && !args.insecure {
+            bail!("{addr} is reachable from the network: the counters stay on loopback without --insecure");
+        }
+        let endpoint = alloyvnc::stats::Endpoint::bind(addr, shared.clone()).await?;
+        tracing::info!(addr = %endpoint.local_addr()?, "stats");
+        tokio::spawn(endpoint.run());
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let capture_thread = alloyvnc::capture::spawn(shared, capture, stop.clone());

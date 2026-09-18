@@ -7,8 +7,10 @@
 //! area is pending. Everything pending goes in one update, so a slow client
 //! sees fewer and larger updates rather than a queue of stale ones.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alloyvnc_encode::{CursorShape, copyrect, cursor, raw};
@@ -21,9 +23,20 @@ use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
+use crate::flow::{Congestion, Limits};
 use crate::shared::{FrameEvent, Shared};
+use crate::stats::SessionStats;
+
+/// Updates the writer may have queued before the session stops building
+/// them. Small on purpose: this is the back-pressure. A deep queue would let
+/// the session run ahead and fill it with updates that are stale by the time
+/// they reach the socket, which is the exact fault the window exists to
+/// prevent; a shallow one turns "the client is behind" into something the
+/// session notices within a frame or two and answers by folding the next
+/// frames into what it already owes rather than by queueing more.
+const WRITER_QUEUE: usize = 8;
 
 /// What every session is told at accept time.
 #[derive(Clone, Debug)]
@@ -35,6 +48,8 @@ pub struct SessionConfig {
     /// The pause before a failed authentication is answered, so a guess
     /// costs time.
     pub auth_fail_delay: Duration,
+    /// Where a client's congestion window starts and how fast it opens.
+    pub flow: Limits,
 }
 
 impl Default for SessionConfig {
@@ -43,6 +58,7 @@ impl Default for SessionConfig {
             password: None,
             max_fps: 60,
             auth_fail_delay: Duration::from_secs(1),
+            flow: Limits::default(),
         }
     }
 }
@@ -75,7 +91,13 @@ pub async fn run(
 
     let frames = shared.frames.subscribe();
     let (rd, wr) = stream.into_split();
+    let written = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
+    let writer = tokio::spawn(write_loop(wr, rx, written.clone()));
+    let stats = SessionStats::new(peer);
+    shared.register(stats.clone());
     let bounds = Rect::new(0, 0, width as i32, height as i32);
+    let flow = Congestion::new(cfg.flow);
     let session = Session {
         shared,
         cfg,
@@ -93,9 +115,43 @@ pub async fn run(
         last_update: None,
         frames,
         out,
-        stats: Stats::default(),
+        tx,
+        written,
+        flow,
+        outbox: VecDeque::new(),
+        held_fence: None,
+        reader_paused: false,
+        newest_frame: None,
+        stats,
     };
-    session.serve(rd, wr).await
+    let outcome = session.serve(rd).await;
+    // The writer stops when its channel closes, which the session dropping
+    // does; waiting for it means the last update is on the wire before the
+    // socket goes.
+    let _ = writer.await;
+    outcome
+}
+
+/// The writer task: one socket, one queue, nothing else.
+///
+/// Writing from the task that reads the client is what makes a slow socket
+/// look like a slow client. `write_all` on a full send buffer waits, and
+/// while it waits nothing reads the client's messages or folds new frames
+/// into what it owes, so the session goes deaf exactly when it is furthest
+/// behind. Here the wait happens somewhere the rest of the session does not
+/// care about.
+async fn write_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::Receiver<Vec<u8>>, written: Arc<AtomicU64>) {
+    while let Some(buf) = rx.recv().await {
+        if let Err(e) = wr.write_all(&buf).await {
+            let e = anyhow::Error::from(e);
+            if !is_gone(&e) {
+                tracing::warn!(error = %e, "write failed");
+            }
+            return;
+        }
+        written.fetch_add(buf.len() as u64, Ordering::Relaxed);
+    }
+    let _ = wr.shutdown().await;
 }
 
 async fn negotiate_version(stream: &mut TcpStream) -> Result<Flow> {
@@ -173,15 +229,6 @@ fn is_gone(e: &anyhow::Error) -> bool {
     })
 }
 
-#[derive(Debug, Default)]
-struct Stats {
-    updates: u64,
-    rects: u64,
-    copy_rects: u64,
-    cursor_rects: u64,
-    bytes: u64,
-}
-
 struct Session {
     shared: Arc<Shared>,
     cfg: Arc<SessionConfig>,
@@ -206,7 +253,27 @@ struct Session {
     last_update: Option<Instant>,
     frames: broadcast::Receiver<FrameEvent>,
     out: Vec<u8>,
-    stats: Stats,
+    /// Ready bytes on their way to the socket. The writer owns the write
+    /// half; nothing else in the session ever touches it, which is what
+    /// keeps a stalled socket from stalling the reader with it.
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Bytes the writer has actually put on the wire.
+    written: Arc<AtomicU64>,
+    flow: Congestion,
+    /// Control messages waiting for room in the writer's queue: fence
+    /// responses, the end of continuous updates, a refused resize.
+    outbox: VecDeque<Vec<u8>>,
+    /// A fence response held back for the next update, because the client
+    /// asked for SyncNext.
+    held_fence: Option<Vec<u8>>,
+    /// The client asked for BlockAfter, so nothing more is read from it
+    /// until its response has been handed over. The bytes wait in the
+    /// socket's own buffer, which is where the kernel is happy to keep them.
+    reader_paused: bool,
+    /// When the newest frame folded into `pending` was captured, so an
+    /// update can say how old the freshest thing in it is.
+    newest_frame: Option<Instant>,
+    stats: Arc<SessionStats>,
 }
 
 impl Session {
@@ -274,51 +341,113 @@ impl Session {
         if let Some(shape) = &ev.cursor {
             self.cursor_pending = Some(shape.clone());
         }
+        // The freshest thing this client is owed. Its age when the update
+        // goes out is what the latency histogram counts.
+        self.newest_frame = Some(ev.at);
     }
 
-    async fn serve(mut self, mut rd: OwnedReadHalf, mut wr: OwnedWriteHalf) -> Result<()> {
-        let outcome = self.serve_loop(&mut rd, &mut wr).await;
+    async fn serve(mut self, mut rd: OwnedReadHalf) -> Result<()> {
+        let outcome = self.serve_loop(&mut rd).await;
+        self.publish();
         // The counts go out whichever way the session ended: a clean close,
         // a reset when the viewer went away, or a protocol error.
-        tracing::info!(peer = %self.peer, stats = ?self.stats, "session over");
+        let s = &self.stats;
+        tracing::info!(
+            peer = %self.peer,
+            updates = s.updates.load(Ordering::Relaxed),
+            rects = s.rects.load(Ordering::Relaxed),
+            copy_rects = s.copy_rects.load(Ordering::Relaxed),
+            cursor_rects = s.cursor_rects.load(Ordering::Relaxed),
+            bytes = s.bytes.load(Ordering::Relaxed),
+            window = self.flow.window(),
+            lost_pings = self.flow.lost,
+            "session over"
+        );
+        self.shared.unregister(&self.stats);
         match outcome {
             Err(e) if is_gone(&e) => Ok(()),
             other => other,
         }
     }
 
-    async fn serve_loop(&mut self, rd: &mut OwnedReadHalf, wr: &mut OwnedWriteHalf) -> Result<()> {
+    /// Copy what the stats endpoint reads out of the session's own state.
+    /// Done once a turn rather than at every change, since nothing here is
+    /// worth a lock and a reader wants a snapshot, not a stream.
+    fn publish(&self) {
+        let s = &self.stats;
+        let micros = |d: Option<Duration>| d.map_or(0, |d| d.as_micros() as u64);
+        s.bytes
+            .store(self.written.load(Ordering::Relaxed), Ordering::Relaxed);
+        s.in_flight.store(self.flow.in_flight(), Ordering::Relaxed);
+        s.window.store(self.flow.window(), Ordering::Relaxed);
+        s.pings_outstanding
+            .store(self.flow.outstanding() as u64, Ordering::Relaxed);
+        s.rtt_micros.store(micros(self.flow.rtt()), Ordering::Relaxed);
+        s.base_rtt_micros
+            .store(micros(self.flow.base_rtt()), Ordering::Relaxed);
+    }
+
+    async fn serve_loop(&mut self, rd: &mut OwnedReadHalf) -> Result<()> {
         let min_interval = Duration::from_micros(1_000_000 / u64::from(self.cfg.max_fps.max(1)));
         let mut inbuf = BytesMut::with_capacity(16 * 1024);
+        // A handle of its own to wait for room on, so the wait does not hold
+        // a borrow of the session that sending would need back.
+        let tx = self.tx.clone();
         loop {
+            let now = Instant::now();
+            self.flow.expire(now);
+
+            // Whatever the client has already sent is handled before
+            // anything else, which is what makes a fence's BlockBefore free:
+            // by the time its response is built, every message that arrived
+            // in front of it has been through here.
+            while !self.reader_paused {
+                let Some((message, used)) = msg::parse_client(&inbuf)? else {
+                    break;
+                };
+                inbuf.advance(used);
+                self.handle(message)?;
+            }
+
+            // A response held for an update that can never come would leave
+            // the client waiting for ever, with its own reader paused if it
+            // asked for BlockAfter as well. Let it go instead.
+            if self.held_fence.is_some() && self.due_area().is_none() {
+                let fence = self.held_fence.take().expect("just checked");
+                self.outbox.push_back(fence);
+            }
+            self.publish();
+
             let mut throttle_until = None;
-            if let Some(area) = self.due_area() {
-                let now = Instant::now();
+            let mut want_send = !self.outbox.is_empty();
+            if !want_send
+                && let Some(area) = self.due_area()
+                && self.has_something_for(area)
+            {
                 let ready_at = self.last_update.map_or(now, |t| t + min_interval);
-                if ready_at <= now {
-                    if self.build_update(area)? {
-                        wr.write_all(&self.out).await.context("write update")?;
-                        self.last_update = Some(now);
-                        continue;
-                    }
-                } else if self.has_something_for(area) {
+                if ready_at > now {
                     throttle_until = Some(ready_at);
+                } else if self.flow.may_send() {
+                    want_send = true;
                 }
+                // Otherwise the window is shut. Nothing is built, the frames
+                // arriving keep folding into what this client is owed, and
+                // its next fence answer opens it again: one larger update
+                // later beats two stale ones now.
             }
 
             if inbuf.capacity() - inbuf.len() < 1024 {
                 inbuf.reserve(16 * 1024);
             }
             tokio::select! {
-                n = rd.read_buf(&mut inbuf) => {
-                    let n = n.context("read")?;
-                    if n == 0 {
+                permit = tx.reserve(), if want_send => {
+                    let permit = permit.context("the writer stopped")?;
+                    self.send_next(permit)?;
+                }
+                n = rd.read_buf(&mut inbuf), if !self.reader_paused => {
+                    if n.context("read")? == 0 {
                         tracing::info!(peer = %self.peer, "client closed");
                         return Ok(());
-                    }
-                    while let Some((message, used)) = msg::parse_client(&inbuf)? {
-                        inbuf.advance(used);
-                        self.handle(message, wr).await?;
                     }
                 }
                 ev = self.frames.recv() => match ev {
@@ -328,6 +457,7 @@ impl Session {
                         let bounds = self.bounds();
                         self.pending = Region::from_rect(bounds);
                         self.copies.clear();
+                        self.newest_frame = Some(Instant::now());
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 },
@@ -337,6 +467,51 @@ impl Session {
         }
     }
 
+    /// Hand one thing to the writer: a control message if any is waiting,
+    /// otherwise an update.
+    fn send_next(&mut self, permit: mpsc::Permit<'_, Vec<u8>>) -> Result<()> {
+        if let Some(buf) = self.outbox.pop_front() {
+            self.flow.wrote(buf.len() as u64);
+            permit.send(buf);
+            // Whatever the client was told to wait for has now gone.
+            self.reader_paused = false;
+            return Ok(());
+        }
+        let Some(area) = self.due_area() else {
+            return Ok(());
+        };
+        if !self.build_update(area)? {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let mut buf = Vec::with_capacity(self.out.len() + 96);
+        if let Some(fence) = self.held_fence.take() {
+            // Immediately before the update and in the same send, so nothing
+            // can arrive between the two: that is what SyncNext asks for.
+            buf.extend_from_slice(&fence);
+            self.reader_paused = false;
+        }
+        buf.extend_from_slice(&self.out);
+        self.flow.wrote(buf.len() as u64);
+        if self.flow.ping_due(now) {
+            // After the update, so the round trip covers the bytes just
+            // queued: the answer says the client has been through all of it.
+            let seq = self.flow.ping(now);
+            msg::write_server_fence(
+                &mut buf,
+                msg::FENCE_REQUEST | msg::FENCE_BLOCK_BEFORE,
+                &seq.to_be_bytes(),
+            );
+        }
+        if let Some(at) = self.newest_frame.take() {
+            self.stats.latency.record(now.saturating_duration_since(at));
+        }
+        self.last_update = Some(now);
+        permit.send(buf);
+        Ok(())
+    }
+
     fn has_something_for(&self, area: Rect) -> bool {
         self.layout_pending
             || (self.cursor_pending.is_some() && self.cursor_encoding().is_some())
@@ -344,7 +519,7 @@ impl Session {
             || self.pending.intersects_rect(&area)
     }
 
-    async fn handle(&mut self, message: ClientMessage, wr: &mut OwnedWriteHalf) -> Result<()> {
+    fn handle(&mut self, message: ClientMessage) -> Result<()> {
         match message {
             ClientMessage::SetPixelFormat(pf) => {
                 pf.validate()
@@ -358,10 +533,15 @@ impl Session {
                 if list.contains(&encoding::PSEUDO_CONTINUOUS_UPDATES) && !self.continuous_offered {
                     // Support is announced the way TigerVNC's server does it:
                     // an EndOfContinuousUpdates before any were enabled.
-                    self.out.clear();
-                    msg::write_end_of_continuous_updates(&mut self.out);
-                    wr.write_all(&self.out).await?;
+                    let mut buf = Vec::with_capacity(4);
+                    msg::write_end_of_continuous_updates(&mut buf);
+                    self.outbox.push_back(buf);
                     self.continuous_offered = true;
+                }
+                if list.contains(&encoding::PSEUDO_FENCE) {
+                    // The client can answer a fence, so the link can be
+                    // measured and a window is worth keeping.
+                    self.flow.measure();
                 }
                 if list.contains(&encoding::PSEUDO_EXTENDED_DESKTOP_SIZE)
                     && !self.supports(encoding::PSEUDO_EXTENDED_DESKTOP_SIZE)
@@ -412,17 +592,47 @@ impl Session {
                     self.continuous = Some(r.intersection(&self.bounds()));
                 } else {
                     self.continuous = None;
-                    self.out.clear();
-                    msg::write_end_of_continuous_updates(&mut self.out);
-                    wr.write_all(&self.out).await?;
+                    let mut buf = Vec::with_capacity(4);
+                    msg::write_end_of_continuous_updates(&mut buf);
+                    self.outbox.push_back(buf);
                 }
             }
             ClientMessage::ClientFence { flags, payload } => {
-                // No ordering guarantees yet: answer at once with the
-                // request bit cleared. Flow control (phase 2) makes this real.
-                self.out.clear();
-                msg::write_server_fence(&mut self.out, flags & !msg::FENCE_REQUEST, &payload);
-                wr.write_all(&self.out).await?;
+                if flags & msg::FENCE_REQUEST == 0 {
+                    // Not a request: this is the client answering one of our
+                    // own pings, and the only fences we send carry an
+                    // eight-byte sequence number. Anything else is some other
+                    // server's idea and is left alone.
+                    if let Ok(seq) = <[u8; 8]>::try_from(&payload[..]) {
+                        let seq = u64::from_be_bytes(seq);
+                        if self.flow.pong(seq, Instant::now()) {
+                            tracing::debug!(
+                                peer = %self.peer,
+                                rtt = ?self.flow.rtt(),
+                                base = ?self.flow.base_rtt(),
+                                window = self.flow.window(),
+                                in_flight = self.flow.in_flight(),
+                                "fence answered"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                // A request. BlockBefore needs nothing done for it: messages
+                // are handled in the order they arrived, so everything sent
+                // before this fence has already been through by now.
+                let mut response = Vec::with_capacity(payload.len() + 12);
+                msg::write_server_fence(&mut response, flags & !msg::FENCE_REQUEST, &payload);
+                if flags & msg::FENCE_BLOCK_AFTER != 0 {
+                    // Nothing more is read from this client until the
+                    // response has gone. Its bytes wait in the socket.
+                    self.reader_paused = true;
+                }
+                if flags & msg::FENCE_SYNC_NEXT != 0 {
+                    self.held_fence = Some(response);
+                } else {
+                    self.outbox.push_back(response);
+                }
             }
             ClientMessage::SetDesktopSize { width, height, .. } => {
                 // The picture is a real screen; a client cannot resize it.
@@ -431,7 +641,8 @@ impl Session {
                 self.out.clear();
                 msg::write_framebuffer_update_header(&mut self.out, 1);
                 self.write_layout_rect(resize_reason::THIS_CLIENT, resize_status::PROHIBITED);
-                wr.write_all(&self.out).await?;
+                let refusal = std::mem::take(&mut self.out);
+                self.outbox.push_back(refusal);
             }
         }
         Ok(())
@@ -499,9 +710,8 @@ impl Session {
             self.pending = Region::from_rect(bounds);
             self.copies.clear();
             self.requested = None;
-            self.stats.updates += 1;
-            self.stats.rects += 1;
-            self.stats.bytes += self.out.len() as u64;
+            self.stats.updates.fetch_add(1, Ordering::Relaxed);
+            self.stats.rects.fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
 
@@ -566,7 +776,7 @@ impl Session {
                     cursor::encode_cursor(&shape, &self.pf, &mut self.out);
                 }
             }
-            self.stats.cursor_rects += 1;
+            self.stats.cursor_rects.fetch_add(1, Ordering::Relaxed);
         }
         for m in &sendable {
             msg::write_rect_header(
@@ -579,7 +789,9 @@ impl Session {
             );
             copyrect::encode(m.src_x as u16, m.src_y as u16, &mut self.out);
         }
-        self.stats.copy_rects += sendable.len() as u64;
+        self.stats
+            .copy_rects
+            .fetch_add(sendable.len() as u64, Ordering::Relaxed);
         {
             let fb = self.shared.fb.read();
             for r in &damage_rects {
@@ -596,9 +808,8 @@ impl Session {
         }
         self.pending = self.pending.subtract(&damage);
         self.requested = None;
-        self.stats.updates += 1;
-        self.stats.rects += n as u64;
-        self.stats.bytes += self.out.len() as u64;
+        self.stats.updates.fetch_add(1, Ordering::Relaxed);
+        self.stats.rects.fetch_add(n as u64, Ordering::Relaxed);
         tracing::trace!(peer = %self.peer, rects = n, copies = sendable.len(), bytes = self.out.len(), "update");
         Ok(true)
     }
