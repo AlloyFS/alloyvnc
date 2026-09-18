@@ -54,6 +54,7 @@ pub struct Synth {
     pace: Pace,
     next_at: Instant,
     ready: bool,
+    coarse: bool,
 }
 
 const BOX_SIZE: i32 = 96;
@@ -79,7 +80,22 @@ impl Synth {
             pace,
             next_at: Instant::now(),
             ready: false,
+            coarse: false,
         }
+    }
+
+    /// Report frames the way a real backend does: one rectangle around
+    /// everything that changed, and no moves at all, however much this
+    /// screen knows about what it drew.
+    ///
+    /// DXGI reports a whole window for one repainted pixel and X11 reports
+    /// the bands its server happened to draw in, and neither says a block
+    /// moved. A screen that hands over exact damage and a ready-made move
+    /// cannot exercise the compare pass, which exists to make those two
+    /// backends behave like this one.
+    pub fn coarse(mut self) -> Synth {
+        self.coarse = true;
+        self
     }
 
     pub fn frames_drawn(&self) -> u64 {
@@ -307,6 +323,14 @@ impl Capture for Synth {
         self.ready = false;
         let frame = self.drawn + 1;
         let mut out = self.draw(fb, frame, prev);
+        if self.coarse {
+            let mut bounds = out.damage.bounds();
+            for m in &out.moves {
+                bounds = bounds.union_bounds(&m.dst);
+            }
+            out.damage = Region::from_rect(bounds);
+            out.moves.clear();
+        }
         out.resized = resized;
         self.drawn = frame;
         if let Pace::Fps(fps) = self.pace {

@@ -22,8 +22,19 @@ struct Rig {
 
 impl Rig {
     async fn start(password: Option<&str>) -> Rig {
+        Rig::start_with(password, false).await
+    }
+
+    /// A rig whose screen reports the way the real backends do: one
+    /// rectangle around everything that changed, and no moves at all.
+    async fn start_coarse() -> Rig {
+        Rig::start_with(None, true).await
+    }
+
+    async fn start_with(password: Option<&str>, coarse: bool) -> Rig {
         let step = Step::new();
         let capture = Synth::new(320, 200, Pace::Manual(step.clone()));
+        let capture = if coarse { capture.coarse() } else { capture };
         let shared = Shared::new("e2e", 320, 200, Box::new(NullInput));
         let session = SessionConfig {
             password: password.map(str::to_owned),
@@ -294,4 +305,33 @@ async fn input_and_cut_text_are_accepted() {
     c.request_all(false).await.unwrap();
     c.next_update().await.unwrap();
     assert_eq!(c.fb.data(), rig.picture());
+}
+
+#[tokio::test]
+async fn the_compare_pass_finds_the_scroll_a_coarse_backend_hides() {
+    let rig = Rig::start_coarse().await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.set_encodings(ALL).await.unwrap();
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+    assert_eq!(c.fb.data(), rig.picture());
+
+    // The screen said only "this rectangle changed" and named no moves, so
+    // any CopyRect here was found by comparing hashes, and the damage beside
+    // it is narrower than the rectangle the screen reported.
+    rig.frames(1).await;
+    c.request_all(true).await.unwrap();
+    let rects = c.next_update().await.unwrap();
+    let copies = rects.iter().filter(|r| r.encoding == encoding::COPY_RECT).count();
+    assert_eq!(copies, 1, "{rects:?}");
+    assert_eq!(c.fb.data(), rig.picture());
+
+    // And it stays exact however the two get out of step.
+    for _ in 0..20 {
+        rig.frames(3).await;
+        c.request_all(true).await.unwrap();
+        c.next_update().await.unwrap();
+        assert_eq!(c.fb.data(), rig.picture());
+    }
 }

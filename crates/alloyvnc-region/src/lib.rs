@@ -176,6 +176,64 @@ impl Region {
         out
     }
 
+    /// Build a region straight from rows of spans, one row at a time.
+    ///
+    /// [`from_rects`](Region::from_rects) unions each rectangle into the
+    /// whole region, which is a walk over everything accumulated so far per
+    /// rectangle. A caller that already knows its pixels row by row, as the
+    /// compare pass does, can hand them over in the order the banded form
+    /// wants and skip all of that: this is one pass, and it allocates only
+    /// the rectangles it ends up with.
+    ///
+    /// The caller promises what the form requires, and a debug build checks
+    /// it: rows arrive with `y` increasing, and each row's spans are sorted,
+    /// non-empty and separated, so `x2 < x1` of the next. Rows with no spans
+    /// are skipped. Consecutive rows with identical spans become one band.
+    pub fn from_rows<I, S>(rows: I) -> Region
+    where
+        I: IntoIterator<Item = (i32, S)>,
+        S: AsRef<[Span]>,
+    {
+        let mut out: Vec<Rect> = Vec::new();
+        // Where the band being built starts in `out`, and the row after it.
+        let mut band: Option<(usize, i32)> = None;
+        let mut previous_y: Option<i32> = None;
+        for (y, spans) in rows {
+            let spans = spans.as_ref();
+            debug_assert!(previous_y.is_none_or(|p| p < y), "rows out of order at {y}");
+            previous_y = Some(y);
+            debug_assert!(
+                spans.windows(2).all(|w| w[0].1 < w[1].0),
+                "spans touching or out of order in row {y}: {spans:?}"
+            );
+            debug_assert!(
+                spans.iter().all(|s| s.0 < s.1),
+                "empty span in row {y}: {spans:?}"
+            );
+            if spans.is_empty() {
+                continue;
+            }
+            match band {
+                // The row carries on the band above it: stretch it down
+                // rather than starting another one.
+                Some((start, next)) if next == y && same_spans(&out[start..], spans) => {
+                    for r in &mut out[start..] {
+                        r.y2 = y + 1;
+                    }
+                    band = Some((start, y + 1));
+                }
+                _ => {
+                    let start = out.len();
+                    for &(x1, x2) in spans {
+                        out.push(Rect::from_corners(x1, y, x2, y + 1));
+                    }
+                    band = Some((start, y + 1));
+                }
+            }
+        }
+        Region { rects: out }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rects.is_empty()
     }
@@ -246,6 +304,11 @@ impl Region {
     pub fn clear(&mut self) {
         self.rects.clear();
     }
+}
+
+/// Whether a band's rectangles cover exactly these spans.
+fn same_spans(rects: &[Rect], spans: &[Span]) -> bool {
+    rects.len() == spans.len() && rects.iter().zip(spans).all(|(r, s)| (r.x1, r.x2) == *s)
 }
 
 fn op(a: &Region, b: &Region, kind: Op) -> Region {
@@ -486,6 +549,69 @@ mod tests {
             let n = 1 + self.below(5);
             Region::from_rects((0..n).map(|_| self.rect()))
         }
+    }
+
+    #[test]
+    fn from_rows_matches_from_rects() {
+        // The oracle unions one rectangle at a time, which is a walk over
+        // the whole region per rectangle, so the input is kept sparse: the
+        // point is the variety of shapes, not their size.
+        let mut rng = Lcg(7);
+        for _ in 0..50 {
+            // Rows of spans, built the way the form requires: increasing y,
+            // and within a row sorted and separated by at least one pixel.
+            let mut rows: Vec<(i32, Vec<Span>)> = Vec::new();
+            let mut y = rng.below(4);
+            while y < SIZE as i32 {
+                let mut spans: Vec<Span> = Vec::new();
+                let mut x = rng.below(6);
+                while x < SIZE as i32 {
+                    let width = 1 + rng.below(9);
+                    let end = (x + width).min(SIZE as i32);
+                    if x < end {
+                        spans.push((x, end));
+                    }
+                    // At least one pixel of gap, or the spans would touch
+                    // and the band would not be in normal form.
+                    x = end + 1 + rng.below(20);
+                }
+                if !spans.is_empty() {
+                    rows.push((y, spans));
+                }
+                y += 1 + rng.below(3);
+            }
+            let by_rows = Region::from_rows(rows.iter().map(|(y, s)| (*y, s.as_slice())));
+            let by_rects = Region::from_rects(rows.iter().flat_map(|(y, s)| {
+                s.iter()
+                    .map(move |(x1, x2)| Rect::from_corners(*x1, *y, *x2, *y + 1))
+            }));
+            check_invariants(&by_rows);
+            assert_eq!(by_rows, by_rects, "rows {rows:?}");
+        }
+    }
+
+    #[test]
+    fn from_rows_merges_bands_and_skips_empties() {
+        // Three identical rows become one band, the gap breaks it, and a
+        // row with no spans contributes nothing.
+        let region = Region::from_rows(vec![
+            (0, vec![(0, 4), (8, 10)]),
+            (1, vec![(0, 4), (8, 10)]),
+            (2, vec![(0, 4), (8, 10)]),
+            (3, vec![]),
+            (4, vec![(0, 4), (8, 10)]),
+        ]);
+        check_invariants(&region);
+        assert_eq!(
+            region.rects(),
+            [
+                Rect::from_corners(0, 0, 4, 3),
+                Rect::from_corners(8, 0, 10, 3),
+                Rect::from_corners(0, 4, 4, 5),
+                Rect::from_corners(8, 4, 10, 5),
+            ]
+        );
+        assert!(Region::from_rows(Vec::<(i32, Vec<Span>)>::new()).is_empty());
     }
 
     #[test]

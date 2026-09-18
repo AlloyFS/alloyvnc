@@ -378,3 +378,20 @@ Things measured or observed that changed the plan, newest last.
   64 rectangles and the bounding box past that; comparing areas rather than
   counts is on the backlog, behind phase 2, which changes the shape of the
   damage anyway.
+- **2026-09-18, the compare pass, measured.** Release build, adjacent runs.
+  X11 on a rooted 1280x720 Xvfb with a clock ticking and eyes following the
+  pointer, 141 frames: 7.47 M pixels reported, 2.18 M after, a ratio of
+  0.29 (0.19 without the opening full frame); the clock's tick is reported
+  as one 199x199 rectangle and goes out as 6,300 to 7,000 pixels, the hands
+  and the marks; 155 µs a frame mean, 1.4 ms for the opening frame. At
+  1080p, 134 µs a frame for ordinary movement and 3.6 ms for a whole-screen
+  repaint, of which 2.55 ms is hashing 8.3 MB (about 3.3 GB/s here) and
+  1.05 ms the scroll detector. DXGI on this laptop's desktop, busy, 24 s,
+  1657 frames: 76.5 M pixels reported, 17.3 M after, a ratio of 0.23; 545
+  of the frames, one in three, changed no pixel at all and no client hears
+  of them now; 24 scrolls found; 0.30 ms a frame mean. Detection is per
+  cell, not per row: a real scroll never owns whole rows (a scrollbar at
+  least), so row matching finds no scroll that exists; every copy emitted
+  is verified cell against cell, so a wrong guess can only copy pixels that
+  were going to be sent anyway. Horizontal scrolls and two panes scrolling
+  by different amounts are not detected; the backlog has both.

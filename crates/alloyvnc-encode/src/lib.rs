@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod compare;
 pub mod convert;
 pub mod copyrect;
 pub mod cursor;
@@ -16,5 +17,6 @@ mod framebuffer;
 
 pub use alloyvnc_proto::PixelFormat;
 pub use alloyvnc_region::Rect;
+pub use compare::{Tightened, Tightener};
 pub use cursor::CursorShape;
 pub use framebuffer::Framebuffer;

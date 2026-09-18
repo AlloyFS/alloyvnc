@@ -12,3 +12,6 @@ workspace = true
 [dependencies]
 alloyvnc-proto.workspace = true
 alloyvnc-region.workspace = true
+# xxh3 is the fast half of xxhash: a few cycles a byte, which is what
+# makes hashing every damaged pixel cheaper than comparing them.
+xxhash-rust.workspace = true
