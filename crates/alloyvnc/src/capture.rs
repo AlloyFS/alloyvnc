@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use alloyvnc_screen::Capture;
 
-use crate::shared::{DamageEvent, Shared};
+use crate::shared::{FrameEvent, Shared};
 
 /// How long one wait blocks before the stop flag is checked again.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
@@ -22,6 +22,7 @@ pub fn spawn(shared: Arc<Shared>, mut capture: Box<dyn Capture>, stop: Arc<Atomi
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
+            *shared.screens.lock() = capture.screens();
             while !stop.load(Ordering::Relaxed) {
                 match capture.wait(WAIT_SLICE) {
                     Ok(false) => continue,
@@ -37,13 +38,24 @@ pub fn spawn(shared: Arc<Shared>, mut capture: Box<dyn Capture>, stop: Arc<Atomi
                     capture.apply(&mut fb)
                 };
                 match applied {
-                    Ok(region) if region.is_empty() => {}
-                    Ok(region) => {
+                    Ok(frame) if frame.is_empty() => {}
+                    Ok(frame) => {
+                        if frame.resized {
+                            let screens = capture.screens();
+                            tracing::info!(?screens, "picture resized");
+                            *shared.screens.lock() = screens;
+                        }
+                        if let Some(shape) = &frame.cursor {
+                            *shared.cursor.lock() = Some(shape.clone());
+                        }
                         let seq = shared.seq.fetch_add(1, Ordering::AcqRel) + 1;
                         // No receivers is not an error: nobody is connected.
-                        let _ = shared.damage.send(DamageEvent {
+                        let _ = shared.frames.send(FrameEvent {
                             seq,
-                            region: Arc::new(region),
+                            damage: Arc::new(frame.damage),
+                            moves: Arc::new(frame.moves),
+                            cursor: frame.cursor,
+                            resized: frame.resized,
                         });
                     }
                     Err(e) => {

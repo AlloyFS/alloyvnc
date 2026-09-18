@@ -21,3 +21,8 @@ parking_lot.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# The Windows capture and input backend, which carries the whole of the
+# Win32 dependency and is absent everywhere else.
+[target.'cfg(windows)'.dependencies]
+alloyvnc-screen-dxgi = { path = "../alloyvnc-screen-dxgi" }

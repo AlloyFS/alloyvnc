@@ -430,6 +430,65 @@ pub fn write_server_fence(out: &mut Vec<u8>, flags: u32, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
+/// Why an ExtendedDesktopSize rectangle was sent: its `x` field.
+pub mod resize_reason {
+    pub const SERVER: u16 = 0;
+    pub const THIS_CLIENT: u16 = 1;
+    pub const OTHER_CLIENT: u16 = 2;
+}
+
+/// How a client's SetDesktopSize went: the rectangle's `y` field.
+pub mod resize_status {
+    pub const OK: u16 = 0;
+    pub const PROHIBITED: u16 = 1;
+    pub const OUT_OF_RESOURCES: u16 = 2;
+    pub const INVALID_LAYOUT: u16 = 3;
+}
+
+/// The payload of an ExtendedDesktopSize rectangle: the screen list.
+pub fn write_extended_desktop_size(out: &mut Vec<u8>, screens: &[Screen]) {
+    out.extend_from_slice(&[screens.len() as u8, 0, 0, 0]);
+    for s in screens {
+        out.extend_from_slice(&s.id.to_be_bytes());
+        out.extend_from_slice(&s.x.to_be_bytes());
+        out.extend_from_slice(&s.y.to_be_bytes());
+        out.extend_from_slice(&s.width.to_be_bytes());
+        out.extend_from_slice(&s.height.to_be_bytes());
+        out.extend_from_slice(&s.flags.to_be_bytes());
+    }
+}
+
+/// The screen list of an ExtendedDesktopSize rectangle, for a client.
+pub fn parse_extended_desktop_size(buf: &[u8]) -> Result<Option<(Vec<Screen>, usize)>, Error> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let n = usize::from(buf[0]);
+    if n > MAX_SCREENS {
+        return Err(Error::TooLong {
+            what: "screen list",
+            len: n,
+            limit: MAX_SCREENS,
+        });
+    }
+    let total = 4 + n * 16;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let screens = buf[4..total]
+        .chunks_exact(16)
+        .map(|b| Screen {
+            id: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            x: u16::from_be_bytes([b[4], b[5]]),
+            y: u16::from_be_bytes([b[6], b[7]]),
+            width: u16::from_be_bytes([b[8], b[9]]),
+            height: u16::from_be_bytes([b[10], b[11]]),
+            flags: u32::from_be_bytes([b[12], b[13], b[14], b[15]]),
+        })
+        .collect();
+    Ok(Some((screens, total)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

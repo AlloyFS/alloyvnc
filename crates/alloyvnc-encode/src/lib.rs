@@ -9,10 +9,12 @@
 
 pub mod convert;
 pub mod copyrect;
+pub mod cursor;
 pub mod raw;
 
 mod framebuffer;
 
 pub use alloyvnc_proto::PixelFormat;
 pub use alloyvnc_region::Rect;
+pub use cursor::CursorShape;
 pub use framebuffer::Framebuffer;

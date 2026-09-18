@@ -115,6 +115,30 @@ impl Rect {
     }
 }
 
+/// A block that moved: `dst` now holds what was at `(src_x, src_y)`, a block
+/// of `dst`'s size. What CopyRect carries, and what a compositor reports for
+/// a scroll or a window drag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Move {
+    pub src_x: i32,
+    pub src_y: i32,
+    pub dst: Rect,
+}
+
+impl Move {
+    pub fn src(&self) -> Rect {
+        Rect::new(self.src_x, self.src_y, self.dst.width(), self.dst.height())
+    }
+
+    pub fn translate(&self, dx: i32, dy: i32) -> Move {
+        Move {
+            src_x: self.src_x + dx,
+            src_y: self.src_y + dy,
+            dst: self.dst.translate(dx, dy),
+        }
+    }
+}
+
 /// A horizontal span `x1..x2` inside one band.
 type Span = (i32, i32);
 

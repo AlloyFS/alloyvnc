@@ -5,6 +5,7 @@ members = [
     "crates/alloyvnc-region",
     "crates/alloyvnc-encode",
     "crates/alloyvnc-screen",
+    "crates/alloyvnc-screen-dxgi",
     "crates/alloyvnc",
 ]
 

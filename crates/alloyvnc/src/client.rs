@@ -1,5 +1,5 @@
-//! A small RFB client: enough to connect, ask for updates and decode Raw
-//! and CopyRect into a framebuffer of its own.
+//! A small RFB client: enough to connect, ask for updates and decode Raw,
+//! CopyRect and the pseudo-rectangles into a framebuffer of its own.
 //!
 //! It exists for the tests and the measurement harness. It is not a viewer:
 //! it draws nothing and speaks only 3.8 with the framebuffer's native pixel
@@ -7,14 +7,21 @@
 
 use std::net::SocketAddr;
 
-use alloyvnc_encode::Framebuffer;
+use alloyvnc_encode::{CursorShape, Framebuffer};
 use alloyvnc_proto::handshake::{self, Flow, ServerInit, security};
-use alloyvnc_proto::msg::{self, server_type};
+use alloyvnc_proto::msg::{self, Screen, server_type};
 use alloyvnc_proto::{PixelFormat, auth, encoding};
 use alloyvnc_region::Rect;
 use anyhow::{Context, Result, bail, ensure};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// One rectangle of an update, as the client saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Received {
+    pub rect: Rect,
+    pub encoding: i32,
+}
 
 #[derive(Debug)]
 pub struct Client {
@@ -26,6 +33,12 @@ pub struct Client {
     /// Fences the server answered, newest last.
     pub fences: Vec<(u32, Vec<u8>)>,
     pub end_of_continuous_updates: u32,
+    /// The pointer as last sent, hidden or not.
+    pub cursor: Option<CursorShape>,
+    /// The screen layout as last announced.
+    pub screens: Vec<Screen>,
+    /// Resizes seen, with the reason and status fields.
+    pub resizes: Vec<(u16, u16)>,
 }
 
 impl Client {
@@ -93,6 +106,9 @@ impl Client {
             last_cut_text: None,
             fences: Vec::new(),
             end_of_continuous_updates: 0,
+            cursor: None,
+            screens: Vec::new(),
+            resizes: Vec::new(),
         })
     }
 
@@ -145,10 +161,23 @@ impl Client {
         Ok(self.stream.write_all(&out).await?)
     }
 
+    pub async fn set_desktop_size(&mut self, width: u16, height: u16) -> Result<()> {
+        let mut out = vec![msg::client_type::SET_DESKTOP_SIZE, 0];
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&[1, 0]);
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        Ok(self.stream.write_all(&out).await?)
+    }
+
     /// Read server messages until one FramebufferUpdate has been applied,
-    /// and return its rectangles. Bells, cut text, fences and
+    /// and return its rectangles in order. Bells, cut text, fences and
     /// EndOfContinuousUpdates are recorded and skipped.
-    pub async fn next_update(&mut self) -> Result<Vec<Rect>> {
+    pub async fn next_update(&mut self) -> Result<Vec<Received>> {
         loop {
             let kind = self.stream.read_u8().await.context("server message")?;
             match kind {
@@ -178,13 +207,54 @@ impl Client {
                                 let sy = u32::from(self.stream.read_u16().await?);
                                 self.fb.copy_within(sx, sy, rect);
                             }
+                            encoding::PSEUDO_CURSOR => {
+                                let mut pixels = vec![0u8; (w * h) as usize * 4];
+                                self.stream.read_exact(&mut pixels).await?;
+                                let mut mask = vec![0u8; (w as usize).div_ceil(8) * h as usize];
+                                self.stream.read_exact(&mut mask).await?;
+                                let stride = (w as usize).div_ceil(8);
+                                let mut rgba = Vec::with_capacity(pixels.len());
+                                for (i, px) in pixels.chunks_exact(4).enumerate() {
+                                    let (cx, cy) = (i % w as usize, i / w as usize);
+                                    let on = mask[cy * stride + cx / 8] & (0x80 >> (cx % 8)) != 0;
+                                    rgba.extend_from_slice(&[px[2], px[1], px[0], if on { 255 } else { 0 }]);
+                                }
+                                self.cursor = Some(CursorShape::new(w, h, x, y, rgba));
+                            }
+                            encoding::PSEUDO_CURSOR_WITH_ALPHA => {
+                                let inner = self.stream.read_i32().await?;
+                                ensure!(inner == encoding::RAW, "cursor with alpha in encoding {inner}");
+                                let mut rgba = vec![0u8; (w * h) as usize * 4];
+                                self.stream.read_exact(&mut rgba).await?;
+                                self.cursor = Some(CursorShape::new(w, h, x, y, rgba));
+                            }
+                            encoding::PSEUDO_DESKTOP_SIZE => {
+                                self.fb.resize(w, h);
+                                self.resizes.push((0, 0));
+                            }
+                            encoding::PSEUDO_EXTENDED_DESKTOP_SIZE => {
+                                let mut head = [0u8; 4];
+                                self.stream.read_exact(&mut head).await?;
+                                let mut buf = head.to_vec();
+                                buf.resize(4 + usize::from(head[0]) * 16, 0);
+                                self.stream.read_exact(&mut buf[4..]).await?;
+                                let (screens, _) =
+                                    msg::parse_extended_desktop_size(&buf)?.context("screen list")?;
+                                self.screens = screens;
+                                self.resizes.push((x as u16, y as u16));
+                                if (x as u16) != msg::resize_reason::THIS_CLIENT
+                                    || (y as u16) == msg::resize_status::OK
+                                {
+                                    self.fb.resize(w, h);
+                                }
+                            }
                             encoding::PSEUDO_LAST_RECT => break,
                             other => bail!(
                                 "encoding {other} ({}) not decoded by the test client",
                                 encoding::name(other)
                             ),
                         }
-                        rects.push(rect);
+                        rects.push(Received { rect, encoding: enc });
                     }
                     return Ok(rects);
                 }

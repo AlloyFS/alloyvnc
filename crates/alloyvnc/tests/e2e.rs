@@ -69,6 +69,17 @@ impl Drop for Rig {
     }
 }
 
+const ALL: &[i32] = &[
+    encoding::RAW,
+    encoding::COPY_RECT,
+    encoding::PSEUDO_CURSOR_WITH_ALPHA,
+    encoding::PSEUDO_CURSOR,
+    encoding::PSEUDO_EXTENDED_DESKTOP_SIZE,
+    encoding::PSEUDO_DESKTOP_SIZE,
+    encoding::PSEUDO_CONTINUOUS_UPDATES,
+    encoding::PSEUDO_FENCE,
+];
+
 #[tokio::test]
 async fn full_then_incremental_updates_reproduce_the_picture() {
     let rig = Rig::start(None).await;
@@ -77,9 +88,7 @@ async fn full_then_incremental_updates_reproduce_the_picture() {
     let mut c = Client::connect(rig.addr, None).await.unwrap();
     assert_eq!(c.name, "e2e");
     assert_eq!((c.fb.width(), c.fb.height()), (320, 200));
-    c.set_encodings(&[encoding::RAW, encoding::COPY_RECT])
-        .await
-        .unwrap();
+    c.set_encodings(&[encoding::RAW]).await.unwrap();
 
     c.request_all(false).await.unwrap();
     let rects = c.next_update().await.unwrap();
@@ -93,10 +102,17 @@ async fn full_then_incremental_updates_reproduce_the_picture() {
     rig.frames(1).await;
     c.request_all(true).await.unwrap();
     let rects = c.next_update().await.unwrap();
-    let area: i64 = rects.iter().map(|r| r.area()).sum();
+    // Without CopyRect the scrolled band is all damage, so this is most of
+    // the picture, but never the whole of it.
+    let area: i64 = rects.iter().map(|r| r.rect.area()).sum();
     assert!(
-        area < 320 * 200 / 2,
+        area < 320 * 200,
         "an incremental update carries only the change: {rects:?}"
+    );
+    assert!(area > 320 * 76, "the scrolled band is in it: {rects:?}");
+    assert!(
+        rects.iter().all(|r| r.encoding == encoding::RAW),
+        "Raw only, as asked"
     );
     assert_eq!(c.fb.data(), rig.picture());
 
@@ -105,6 +121,113 @@ async fn full_then_incremental_updates_reproduce_the_picture() {
     c.request_all(true).await.unwrap();
     c.next_update().await.unwrap();
     assert_eq!(c.fb.data(), rig.picture());
+}
+
+#[tokio::test]
+async fn moves_go_out_as_copyrect_when_the_source_is_current() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.set_encodings(ALL).await.unwrap();
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+
+    // One frame: the band's scroll arrives as a CopyRect, the rest as Raw.
+    rig.frames(1).await;
+    c.request_all(true).await.unwrap();
+    let rects = c.next_update().await.unwrap();
+    let copies: Vec<_> = rects
+        .iter()
+        .filter(|r| r.encoding == encoding::COPY_RECT)
+        .collect();
+    assert_eq!(copies.len(), 1, "{rects:?}");
+    assert_eq!(copies[0].rect.height(), 76, "the band less the scrolled rows");
+    assert_eq!(c.fb.data(), rig.picture());
+
+    // Five frames unrequested: only the first scroll is still a valid copy;
+    // the later ones land on damaged sources and go out as pixels.
+    rig.frames(5).await;
+    c.request_all(true).await.unwrap();
+    let rects = c.next_update().await.unwrap();
+    let copies = rects.iter().filter(|r| r.encoding == encoding::COPY_RECT).count();
+    assert_eq!(copies, 1, "{rects:?}");
+    assert_eq!(c.fb.data(), rig.picture());
+
+    // Many frames more, always exact.
+    for _ in 0..20 {
+        rig.frames(3).await;
+        c.request_all(true).await.unwrap();
+        c.next_update().await.unwrap();
+        assert_eq!(c.fb.data(), rig.picture());
+    }
+}
+
+#[tokio::test]
+async fn cursor_and_layout_pseudo_rects() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.set_encodings(ALL).await.unwrap();
+    c.request_all(false).await.unwrap();
+    let rects = c.next_update().await.unwrap();
+    assert!(
+        rects
+            .iter()
+            .any(|r| r.encoding == encoding::PSEUDO_EXTENDED_DESKTOP_SIZE),
+        "the layout is announced once the client supports it: {rects:?}"
+    );
+    assert_eq!(c.screens.len(), 1);
+    assert_eq!((c.screens[0].width, c.screens[0].height), (320, 200));
+
+    // A second client that takes only the old Cursor encoding; both watch
+    // the same shape change.
+    let mut old = Client::connect(rig.addr, None).await.unwrap();
+    old.set_encodings(&[encoding::RAW, encoding::PSEUDO_CURSOR])
+        .await
+        .unwrap();
+    old.request_all(false).await.unwrap();
+    old.next_update().await.unwrap();
+
+    // The pointer shape of the first frame was published before either
+    // client connected; the next shape change brings one to both.
+    rig.frames(30).await;
+    c.request_all(true).await.unwrap();
+    let rects = c.next_update().await.unwrap();
+    assert!(
+        rects
+            .iter()
+            .any(|r| r.encoding == encoding::PSEUDO_CURSOR_WITH_ALPHA),
+        "{rects:?}"
+    );
+    let shape = c.cursor.clone().expect("a pointer shape");
+    assert_eq!((shape.width, shape.height), (12, 12));
+    assert_eq!(c.fb.data(), rig.picture());
+
+    old.request_all(true).await.unwrap();
+    let rects = old.next_update().await.unwrap();
+    assert!(
+        rects.iter().any(|r| r.encoding == encoding::PSEUDO_CURSOR),
+        "{rects:?}"
+    );
+    let masked = old.cursor.clone().expect("a pointer shape");
+    assert_eq!((masked.width, masked.height), (12, 12));
+    // Same shape through both encodings, alpha reduced to a mask.
+    let expect: Vec<u8> = shape
+        .rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2], if p[3] >= 128 { 255 } else { 0 }])
+        .collect();
+    assert_eq!(masked.rgba, expect);
+
+    // A client asking to resize the screen is told no, with the layout.
+    c.set_desktop_size(640, 480).await.unwrap();
+    let rects = c.next_update().await.unwrap();
+    assert_eq!(rects.len(), 1);
+    assert_eq!(
+        c.resizes.last(),
+        Some(&(msg::resize_reason::THIS_CLIENT, msg::resize_status::PROHIBITED))
+    );
+    assert_eq!((c.fb.width(), c.fb.height()), (320, 200), "not resized");
 }
 
 #[tokio::test]
@@ -129,13 +252,18 @@ async fn continuous_updates_push_without_requests() {
         assert_eq!(c.fb.data(), rig.picture());
     }
     c.enable_continuous_updates(false).await.unwrap();
-    // The acknowledgement arrives on its own; a frame after it is not pushed.
+    // The acknowledgement arrives on its own. A push for a frame the server
+    // saw before it read the disable may still precede it, which the
+    // protocol allows; the fence echo marks the point past which nothing is
+    // pushed, so read until it arrives.
     rig.frames(1).await;
     c.fence(msg::FENCE_REQUEST | msg::FENCE_SYNC_NEXT, b"ping")
         .await
         .unwrap();
-    c.request_all(true).await.unwrap();
-    c.next_update().await.unwrap();
+    c.request_all(false).await.unwrap();
+    while c.fences.is_empty() {
+        c.next_update().await.unwrap();
+    }
     assert_eq!(c.end_of_continuous_updates, 2);
     assert_eq!(c.fences, vec![(msg::FENCE_SYNC_NEXT, b"ping".to_vec())]);
     assert_eq!(c.fb.data(), rig.picture());

@@ -328,3 +328,30 @@ Things measured or observed that changed the plan, newest last.
   ContinuousUpdates, ExtendedMouseButtons, ExtendedClipboard, VMwareCursor,
   Cursor. Open H.264 above Tight is what makes phase 7's encoder worth it in
   the browser.
+- **2026-09-18, DXGI reports no move rectangles on Windows 11.** A window
+  drag by hand, a programmatic SetWindowPos walk and a forty-page Notepad
+  scroll all arrived as dirty rectangles: 0 moves in 2829 frames. The
+  compositor repaints rather than blits, so GetFrameMoveRects stays empty.
+  The move path is implemented and its arithmetic tested, but CopyRect on
+  this OS has to come from the compare pass of phase 2, which can detect a
+  vertical shift by hashing rows. The phase 1 gate "a scroll sends CopyRect"
+  is not met by DXGI metadata alone.
+- **2026-09-18, DuplicateOutput is refused now and then on this laptop.**
+  E_ACCESSDENIED from a healthy desktop, five times in four minutes, then
+  success with nothing changed. RealVNC Server runs here as SYSTEM with a
+  live session from the phone, and a more privileged process holding the
+  desktop image is what that error means; not proven, since both were
+  running during the successful runs too. The start retries five times,
+  400 ms apart. RealVNC also owns port 5900 on every interface, which is
+  why the tests and the rig use 5901.
+- **2026-09-18, phase 1 numbers.** Release build, adjacent runs, this
+  laptop, the desktop busy (this app redrawing), noVNC in a hidden tab, Raw
+  only: 2.0% of one core and 30.8 MB with no client; 4.7% and 38.8 MB with
+  one, 237 updates, 343 rectangles and 190 MB in 22 s. The same run in a
+  debug build read 60%: a number from a debug build says nothing about the
+  code. The bytes are Raw's (8.6 MB/s) and the rectangles are DXGI's, a
+  whole window per change; phase 3 and phase 2 respectively.
+- **2026-09-18, a fronted viewer feeds the picture into itself.** With the
+  noVNC tab visible on the captured desktop every update changes the screen
+  and produces the next. Measurements keep the tab hidden: `cdp.ts open`
+  fronts a tab, `Target.createTarget` with `background: true` does not.
