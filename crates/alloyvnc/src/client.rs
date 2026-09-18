@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use alloyvnc_encode::decode::{self, DecodeError, TightReader, ZrleReader};
 use alloyvnc_encode::{CursorShape, Framebuffer};
 use alloyvnc_proto::handshake::{self, Flow, ServerInit, security};
-use alloyvnc_proto::msg::{self, Screen, server_type};
+use alloyvnc_proto::msg::{self, ClipboardMessage, Screen, clipboard, server_type};
 use alloyvnc_proto::{PixelFormat, auth, encoding};
 use alloyvnc_region::Rect;
 use anyhow::{Context, Result, bail, ensure};
@@ -29,7 +29,19 @@ pub struct Client {
     /// The picture as decoded so far.
     pub fb: Framebuffer,
     pub name: String,
+    /// The last clipboard text the server handed over, by either route.
     pub last_cut_text: Option<String>,
+    /// Every Extended Clipboard message the server sent, in order.
+    pub clip_messages: Vec<ClipboardMessage>,
+    /// Clipboard text the server handed over, newest last.
+    pub clip_text: Vec<String>,
+    /// Do not answer a notify. A real viewer asks for the text when
+    /// somebody presses paste, which may be never; this is how a test plays
+    /// one that has not pasted yet.
+    pub hold_clipboard: bool,
+    /// Clipboard messages of every kind counted, so a test can wait for the
+    /// next one without knowing which kind it will be.
+    pub clipboard_seq: u64,
     /// Fences the server sent, newest last.
     pub fences: Vec<(u32, Vec<u8>)>,
     /// Fences the server asked to have echoed, which is how it measures the
@@ -148,6 +160,10 @@ impl Client {
             screens: Vec::new(),
             resizes: Vec::new(),
             order: Vec::new(),
+            clip_messages: Vec::new(),
+            clip_text: Vec::new(),
+            hold_clipboard: false,
+            clipboard_seq: 0,
             pf: PixelFormat::bgrx32(),
             payload: Vec::new(),
             zrle: ZrleReader::new(),
@@ -220,173 +236,223 @@ impl Client {
     /// Read server messages until one FramebufferUpdate has been applied,
     /// and return its rectangles in order. Bells, cut text, fences and
     /// EndOfContinuousUpdates are recorded and skipped.
+    /// Read server messages until one FramebufferUpdate has been applied,
+    /// and return its rectangles in order. Bells, cut text, fences and
+    /// EndOfContinuousUpdates are recorded and skipped.
     pub async fn next_update(&mut self) -> Result<Vec<Received>> {
         loop {
-            let kind = self.stream.read_u8().await.context("server message")?;
-            self.order.push(kind);
-            match kind {
-                server_type::FRAMEBUFFER_UPDATE => {
-                    self.stream.read_u8().await?;
-                    let n = self.stream.read_u16().await?;
-                    let mut rects = Vec::with_capacity(usize::from(n));
-                    for _ in 0..n {
-                        let x = u32::from(self.stream.read_u16().await?);
-                        let y = u32::from(self.stream.read_u16().await?);
-                        let w = u32::from(self.stream.read_u16().await?);
-                        let h = u32::from(self.stream.read_u16().await?);
-                        let enc = self.stream.read_i32().await?;
-                        let rect = Rect::new(x as i32, y as i32, w as i32, h as i32);
-                        match enc {
-                            encoding::RAW => {
-                                let mut pixels = vec![0u8; (w * h) as usize * Framebuffer::BYTES_PER_PIXEL];
-                                self.stream.read_exact(&mut pixels).await.context("raw pixels")?;
-                                ensure!(
-                                    self.fb.bounds().contains(&rect),
-                                    "rect {rect:?} outside the picture"
-                                );
-                                self.fb.blit(x, y, w, h, &pixels);
-                            }
-                            encoding::COPY_RECT => {
-                                let sx = u32::from(self.stream.read_u16().await?);
-                                let sy = u32::from(self.stream.read_u16().await?);
-                                self.fb.copy_within(sx, sy, rect);
-                            }
-                            encoding::PSEUDO_CURSOR => {
-                                let mut pixels = vec![0u8; (w * h) as usize * 4];
-                                self.stream.read_exact(&mut pixels).await?;
-                                let mut mask = vec![0u8; (w as usize).div_ceil(8) * h as usize];
-                                self.stream.read_exact(&mut mask).await?;
-                                let stride = (w as usize).div_ceil(8);
-                                let mut rgba = Vec::with_capacity(pixels.len());
-                                for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate() {
-                                    let (cx, cy) = (i % w as usize, i / w as usize);
-                                    let on = mask[cy * stride + cx / 8] & (0x80 >> (cx % 8)) != 0;
-                                    rgba.extend_from_slice(&[px[2], px[1], px[0], if on { 255 } else { 0 }]);
-                                }
-                                self.cursor = Some(CursorShape::new(w, h, x, y, rgba));
-                            }
-                            encoding::PSEUDO_CURSOR_WITH_ALPHA => {
-                                let inner = self.stream.read_i32().await?;
-                                ensure!(inner == encoding::RAW, "cursor with alpha in encoding {inner}");
-                                let mut rgba = vec![0u8; (w * h) as usize * 4];
-                                self.stream.read_exact(&mut rgba).await?;
-                                self.cursor = Some(CursorShape::new(w, h, x, y, rgba));
-                            }
-                            encoding::PSEUDO_DESKTOP_SIZE => {
-                                self.fb.resize(w, h);
-                                self.resizes.push((0, 0));
-                            }
-                            encoding::PSEUDO_EXTENDED_DESKTOP_SIZE => {
-                                let mut head = [0u8; 4];
-                                self.stream.read_exact(&mut head).await?;
-                                let mut buf = head.to_vec();
-                                buf.resize(4 + usize::from(head[0]) * 16, 0);
-                                self.stream.read_exact(&mut buf[4..]).await?;
-                                let (screens, _) =
-                                    msg::parse_extended_desktop_size(&buf)?.context("screen list")?;
-                                self.screens = screens;
-                                self.resizes.push((x as u16, y as u16));
-                                if (x as u16) != msg::resize_reason::THIS_CLIENT
-                                    || (y as u16) == msg::resize_status::OK
-                                {
-                                    self.fb.resize(w, h);
-                                }
-                            }
-                            encoding::HEXTILE => {
-                                // Hextile describes its own length only by
-                                // being read, so the payload grows until the
-                                // decoder stops asking. Nothing it does is
-                                // stateful, so starting again with more
-                                // bytes costs only the work.
-                                self.payload.clear();
-                                loop {
-                                    match decode::hextile(&self.payload, rect, &self.pf, &mut self.fb) {
-                                        Ok(_) => break,
-                                        Err(DecodeError::Truncated(more)) => {
-                                            self.read_more(more.max(1)).await?
-                                        }
-                                        Err(e) => bail!("hextile: {e}"),
-                                    }
-                                }
-                            }
-                            encoding::ZRLE => {
-                                // A length, then that many bytes, and only
-                                // then the inflater: feeding a zlib stream
-                                // half a block ruins every rectangle after.
-                                self.payload.clear();
-                                self.read_more(4).await?;
-                                let length =
-                                    u32::from_be_bytes(self.payload[..4].try_into().expect("four bytes"))
-                                        as usize;
-                                self.read_more(length).await?;
-                                self.zrle
-                                    .decode(&self.payload, rect, &self.pf, &mut self.fb)
-                                    .with_context(|| format!("zrle {rect:?}"))?;
-                            }
-                            encoding::TIGHT => {
-                                // The header says how long the piece is, and
-                                // reading it touches no stream, so it is safe
-                                // to try on a payload still arriving.
-                                self.payload.clear();
-                                let need = loop {
-                                    match TightReader::payload_len(&self.payload, rect, &self.pf) {
-                                        Ok(n) => break n,
-                                        Err(DecodeError::Truncated(more)) => {
-                                            self.read_more(more.max(1)).await?
-                                        }
-                                        Err(e) => bail!("tight header: {e}"),
-                                    }
-                                };
-                                if self.payload.len() < need {
-                                    let more = need - self.payload.len();
-                                    self.read_more(more).await?;
-                                }
-                                self.tight
-                                    .decode(&self.payload[..need], rect, &self.pf, &mut self.fb)
-                                    .with_context(|| format!("tight {rect:?}"))?;
-                            }
-                            encoding::PSEUDO_LAST_RECT => break,
-                            other => bail!(
-                                "encoding {other} ({}) not decoded by the test client",
-                                encoding::name(other)
-                            ),
-                        }
-                        rects.push(Received { rect, encoding: enc });
-                    }
-                    return Ok(rects);
-                }
-                server_type::BELL => {}
-                server_type::SERVER_CUT_TEXT => {
-                    let mut pad = [0u8; 3];
-                    self.stream.read_exact(&mut pad).await?;
-                    let len = self.stream.read_u32().await? as usize;
-                    ensure!(len <= msg::MAX_CUT_TEXT, "cut text of {len} bytes");
-                    let mut raw = vec![0u8; len];
-                    self.stream.read_exact(&mut raw).await?;
-                    self.last_cut_text = Some(msg::latin1_to_string(&raw));
-                }
-                server_type::END_OF_CONTINUOUS_UPDATES => self.end_of_continuous_updates += 1,
-                server_type::SERVER_FENCE => {
-                    let mut pad = [0u8; 3];
-                    self.stream.read_exact(&mut pad).await?;
-                    let flags = self.stream.read_u32().await?;
-                    let len = usize::from(self.stream.read_u8().await?);
-                    ensure!(len <= msg::MAX_FENCE_PAYLOAD, "fence payload of {len} bytes");
-                    let mut payload = vec![0u8; len];
-                    self.stream.read_exact(&mut payload).await?;
-                    self.fences.push((flags, payload.clone()));
-                    if flags & msg::FENCE_REQUEST != 0 {
-                        self.pings += 1;
-                        if self.hold_fences {
-                            self.held.push((flags, payload));
-                        } else {
-                            self.echo(flags, &payload).await?;
-                        }
-                    }
-                }
-                other => bail!("server message type {other} not handled by the test client"),
+            if let Some(rects) = self.one_message().await? {
+                return Ok(rects);
             }
         }
+    }
+
+    /// Read server messages until one more clipboard message of any kind,
+    /// plain or extended. Frames on the way past are applied.
+    pub async fn next_clipboard(&mut self) -> Result<()> {
+        let was = self.clipboard_seq;
+        while self.clipboard_seq == was {
+            self.one_message().await?;
+        }
+        Ok(())
+    }
+
+    /// Read server messages until the server has actually handed text over,
+    /// whichever of the two routes it took to do it.
+    pub async fn next_clipboard_text(&mut self) -> Result<String> {
+        let was = self.clip_text.len();
+        while self.clip_text.len() == was {
+            self.one_message().await?;
+        }
+        Ok(self.clip_text.last().cloned().expect("just grew"))
+    }
+
+    /// One server message, whatever it is. `Some` when it was a
+    /// FramebufferUpdate, with its rectangles in order.
+    async fn one_message(&mut self) -> Result<Option<Vec<Received>>> {
+        let kind = self.stream.read_u8().await.context("server message")?;
+        self.order.push(kind);
+        match kind {
+            server_type::FRAMEBUFFER_UPDATE => {
+                self.stream.read_u8().await?;
+                let n = self.stream.read_u16().await?;
+                let mut rects = Vec::with_capacity(usize::from(n));
+                for _ in 0..n {
+                    let x = u32::from(self.stream.read_u16().await?);
+                    let y = u32::from(self.stream.read_u16().await?);
+                    let w = u32::from(self.stream.read_u16().await?);
+                    let h = u32::from(self.stream.read_u16().await?);
+                    let enc = self.stream.read_i32().await?;
+                    let rect = Rect::new(x as i32, y as i32, w as i32, h as i32);
+                    match enc {
+                        encoding::RAW => {
+                            let mut pixels = vec![0u8; (w * h) as usize * Framebuffer::BYTES_PER_PIXEL];
+                            self.stream.read_exact(&mut pixels).await.context("raw pixels")?;
+                            ensure!(
+                                self.fb.bounds().contains(&rect),
+                                "rect {rect:?} outside the picture"
+                            );
+                            self.fb.blit(x, y, w, h, &pixels);
+                        }
+                        encoding::COPY_RECT => {
+                            let sx = u32::from(self.stream.read_u16().await?);
+                            let sy = u32::from(self.stream.read_u16().await?);
+                            self.fb.copy_within(sx, sy, rect);
+                        }
+                        encoding::PSEUDO_CURSOR => {
+                            let mut pixels = vec![0u8; (w * h) as usize * 4];
+                            self.stream.read_exact(&mut pixels).await?;
+                            let mut mask = vec![0u8; (w as usize).div_ceil(8) * h as usize];
+                            self.stream.read_exact(&mut mask).await?;
+                            let stride = (w as usize).div_ceil(8);
+                            let mut rgba = Vec::with_capacity(pixels.len());
+                            for (i, px) in pixels.as_chunks::<4>().0.iter().enumerate() {
+                                let (cx, cy) = (i % w as usize, i / w as usize);
+                                let on = mask[cy * stride + cx / 8] & (0x80 >> (cx % 8)) != 0;
+                                rgba.extend_from_slice(&[px[2], px[1], px[0], if on { 255 } else { 0 }]);
+                            }
+                            self.cursor = Some(CursorShape::new(w, h, x, y, rgba));
+                        }
+                        encoding::PSEUDO_CURSOR_WITH_ALPHA => {
+                            let inner = self.stream.read_i32().await?;
+                            ensure!(inner == encoding::RAW, "cursor with alpha in encoding {inner}");
+                            let mut rgba = vec![0u8; (w * h) as usize * 4];
+                            self.stream.read_exact(&mut rgba).await?;
+                            self.cursor = Some(CursorShape::new(w, h, x, y, rgba));
+                        }
+                        encoding::PSEUDO_DESKTOP_SIZE => {
+                            self.fb.resize(w, h);
+                            self.resizes.push((0, 0));
+                        }
+                        encoding::PSEUDO_EXTENDED_DESKTOP_SIZE => {
+                            let mut head = [0u8; 4];
+                            self.stream.read_exact(&mut head).await?;
+                            let mut buf = head.to_vec();
+                            buf.resize(4 + usize::from(head[0]) * 16, 0);
+                            self.stream.read_exact(&mut buf[4..]).await?;
+                            let (screens, _) =
+                                msg::parse_extended_desktop_size(&buf)?.context("screen list")?;
+                            self.screens = screens;
+                            self.resizes.push((x as u16, y as u16));
+                            if (x as u16) != msg::resize_reason::THIS_CLIENT
+                                || (y as u16) == msg::resize_status::OK
+                            {
+                                self.fb.resize(w, h);
+                            }
+                        }
+                        encoding::HEXTILE => {
+                            // Hextile describes its own length only by
+                            // being read, so the payload grows until the
+                            // decoder stops asking. Nothing it does is
+                            // stateful, so starting again with more
+                            // bytes costs only the work.
+                            self.payload.clear();
+                            loop {
+                                match decode::hextile(&self.payload, rect, &self.pf, &mut self.fb) {
+                                    Ok(_) => break,
+                                    Err(DecodeError::Truncated(more)) => self.read_more(more.max(1)).await?,
+                                    Err(e) => bail!("hextile: {e}"),
+                                }
+                            }
+                        }
+                        encoding::ZRLE => {
+                            // A length, then that many bytes, and only
+                            // then the inflater: feeding a zlib stream
+                            // half a block ruins every rectangle after.
+                            self.payload.clear();
+                            self.read_more(4).await?;
+                            let length = u32::from_be_bytes(self.payload[..4].try_into().expect("four bytes"))
+                                as usize;
+                            self.read_more(length).await?;
+                            self.zrle
+                                .decode(&self.payload, rect, &self.pf, &mut self.fb)
+                                .with_context(|| format!("zrle {rect:?}"))?;
+                        }
+                        encoding::TIGHT => {
+                            // The header says how long the piece is, and
+                            // reading it touches no stream, so it is safe
+                            // to try on a payload still arriving.
+                            self.payload.clear();
+                            let need = loop {
+                                match TightReader::payload_len(&self.payload, rect, &self.pf) {
+                                    Ok(n) => break n,
+                                    Err(DecodeError::Truncated(more)) => self.read_more(more.max(1)).await?,
+                                    Err(e) => bail!("tight header: {e}"),
+                                }
+                            };
+                            if self.payload.len() < need {
+                                let more = need - self.payload.len();
+                                self.read_more(more).await?;
+                            }
+                            self.tight
+                                .decode(&self.payload[..need], rect, &self.pf, &mut self.fb)
+                                .with_context(|| format!("tight {rect:?}"))?;
+                        }
+                        encoding::PSEUDO_LAST_RECT => break,
+                        other => bail!(
+                            "encoding {other} ({}) not decoded by the test client",
+                            encoding::name(other)
+                        ),
+                    }
+                    rects.push(Received { rect, encoding: enc });
+                }
+                return Ok(Some(rects));
+            }
+            server_type::BELL => {}
+            server_type::SERVER_CUT_TEXT => {
+                let mut pad = [0u8; 3];
+                self.stream.read_exact(&mut pad).await?;
+                // A negative length is the Extended Clipboard extension
+                // borrowing the message; the magnitude is the body.
+                let len = self.stream.read_u32().await? as i32;
+                let n = len.unsigned_abs() as usize;
+                ensure!(n <= msg::MAX_CUT_TEXT, "cut text of {n} bytes");
+                let mut raw = vec![0u8; n];
+                self.stream.read_exact(&mut raw).await?;
+                self.clipboard_seq += 1;
+                if len < 0 {
+                    let message = msg::parse_clipboard(&raw)?;
+                    if let ClipboardMessage::Provide { text: Some(text) } = &message {
+                        self.clip_text.push(text.clone());
+                        self.last_cut_text = Some(text.clone());
+                    }
+                    let notified = matches!(
+                        message,
+                        ClipboardMessage::Notify(formats)
+                            if formats & clipboard::format::TEXT != 0
+                    );
+                    self.clip_messages.push(message);
+                    if notified && !self.hold_clipboard {
+                        self.clipboard_request().await?;
+                    }
+                } else {
+                    let text = msg::latin1_to_string(&raw);
+                    self.clip_text.push(text.clone());
+                    self.last_cut_text = Some(text);
+                }
+            }
+            server_type::END_OF_CONTINUOUS_UPDATES => self.end_of_continuous_updates += 1,
+            server_type::SERVER_FENCE => {
+                let mut pad = [0u8; 3];
+                self.stream.read_exact(&mut pad).await?;
+                let flags = self.stream.read_u32().await?;
+                let len = usize::from(self.stream.read_u8().await?);
+                ensure!(len <= msg::MAX_FENCE_PAYLOAD, "fence payload of {len} bytes");
+                let mut payload = vec![0u8; len];
+                self.stream.read_exact(&mut payload).await?;
+                self.fences.push((flags, payload.clone()));
+                if flags & msg::FENCE_REQUEST != 0 {
+                    self.pings += 1;
+                    if self.hold_fences {
+                        self.held.push((flags, payload));
+                    } else {
+                        self.echo(flags, &payload).await?;
+                    }
+                }
+            }
+            other => bail!("server message type {other} not handled by the test client"),
+        }
+        Ok(None)
     }
 
     /// Append `n` more bytes of the current rectangle's payload.
@@ -397,6 +463,69 @@ impl Client {
             .read_exact(&mut self.payload[at..])
             .await
             .context("rectangle payload")?;
+        Ok(())
+    }
+
+    /// Plain cut text, which is all a client without the extension has:
+    /// Latin-1 on the wire, so anything outside it is lost on the way.
+    pub async fn cut_text(&mut self, text: &str) -> Result<()> {
+        let mut out = Vec::new();
+        msg::write_client_cut_text(&mut out, text);
+        self.stream.write_all(&out).await?;
+        Ok(())
+    }
+
+    /// Open the extension: this client takes text, up to the same limit the
+    /// plain message has, and answers every action.
+    pub async fn clipboard_caps(&mut self) -> Result<()> {
+        let body = msg::clipboard_caps(
+            clipboard::format::TEXT,
+            clipboard::action::REQUEST
+                | clipboard::action::PEEK
+                | clipboard::action::NOTIFY
+                | clipboard::action::PROVIDE,
+            &[msg::MAX_CUT_TEXT as u32],
+        );
+        self.clipboard_body(&body).await
+    }
+
+    /// Say something was copied over here, without sending it.
+    pub async fn clipboard_notify(&mut self) -> Result<()> {
+        let body = msg::clipboard_flags(clipboard::action::NOTIFY, clipboard::format::TEXT);
+        self.clipboard_body(&body).await
+    }
+
+    /// Ask for what the server said it holds.
+    pub async fn clipboard_request(&mut self) -> Result<()> {
+        let body = msg::clipboard_flags(clipboard::action::REQUEST, clipboard::format::TEXT);
+        self.clipboard_body(&body).await
+    }
+
+    /// Ask what the server holds without wanting it sent.
+    pub async fn clipboard_peek(&mut self) -> Result<()> {
+        let body = msg::clipboard_flags(clipboard::action::PEEK, 0);
+        self.clipboard_body(&body).await
+    }
+
+    /// Here it is: UTF-8, compressed, whole.
+    pub async fn clipboard_provide(&mut self, text: &str) -> Result<()> {
+        let body = msg::clipboard_provide_text(text);
+        self.clipboard_body(&body).await
+    }
+
+    /// The same, with the stream flushed and not finished, which is the
+    /// shape noVNC and TigerVNC actually put on the wire.
+    pub async fn clipboard_provide_flushed(&mut self, text: &str) -> Result<()> {
+        let body = msg::clipboard_provide_text_flushed(text);
+        self.clipboard_body(&body).await
+    }
+
+    /// Any body at all, for the shapes a real client should never send and
+    /// a test has to.
+    pub async fn clipboard_body(&mut self, body: &[u8]) -> Result<()> {
+        let mut out = Vec::new();
+        msg::write_client_clipboard(&mut out, body);
+        self.stream.write_all(&out).await?;
         Ok(())
     }
 

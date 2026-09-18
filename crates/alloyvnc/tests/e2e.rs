@@ -10,15 +10,18 @@ use alloyvnc::flow::Limits;
 use alloyvnc::server::Server;
 use alloyvnc::session::SessionConfig;
 use alloyvnc::shared::Shared;
+use alloyvnc_proto::msg::ClipboardMessage;
 use alloyvnc_proto::{encoding, msg};
 use alloyvnc_screen::NullInput;
-use alloyvnc_screen::synth::{Pace, Step, Synth};
+use alloyvnc_screen::synth::{FakeClipboard, Pace, Step, Synth};
 
 struct Rig {
     addr: SocketAddr,
     shared: Arc<Shared>,
     step: Arc<Step>,
     stop: Arc<AtomicBool>,
+    /// The desk's clipboard, which a test copies to and reads back.
+    clip: FakeClipboard,
 }
 
 impl Rig {
@@ -50,7 +53,8 @@ impl Rig {
         let step = Step::new();
         let capture = Synth::new(320, 200, Pace::Manual(step.clone()));
         let capture = if coarse { capture.coarse() } else { capture };
-        let shared = Shared::new("e2e", 320, 200, Box::new(NullInput));
+        let clip = FakeClipboard::new();
+        let shared = Shared::new("e2e", 320, 200, Box::new(NullInput), Box::new(clip.clone()));
         let session = SessionConfig {
             password: password.map(str::to_owned),
             max_fps: 1000,
@@ -69,7 +73,21 @@ impl Rig {
             shared,
             step,
             stop,
+            clip,
         }
+    }
+
+    /// Wait for something the capture thread does on its own clock. The
+    /// clipboard is polled once per wait slice, so this is the same shape
+    /// as `frames` and for the same reason.
+    async fn until(&self, mut done: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("the capture thread never got there");
     }
 
     /// Draw `n` more frames and wait until the capture thread has applied them.
@@ -735,4 +753,252 @@ async fn the_clients_own_order_decides_the_encoding() {
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
     assert!(tight > 0, "{doc}");
+}
+
+/// A client with no extension gets the plain message, and the plain message
+/// is Latin-1: the tick is lost on the way out and the accent survives.
+#[tokio::test]
+async fn plain_cut_text_carries_what_latin1_can_and_no_more() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.set_encodings(ALL).await.unwrap();
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+
+    // Somebody at the desk copies something.
+    rig.clip.copy("héllo ✓");
+    assert_eq!(c.next_clipboard_text().await.unwrap(), "héllo ?");
+
+    // And the other way: what the client sends reaches the desk whole,
+    // because it was Latin-1 to begin with.
+    c.cut_text("from the client").await.unwrap();
+    rig.until(|| rig.clip.written() == ["from the client"]).await;
+}
+
+/// The extension's whole point, end to end: the text is UTF-8 and the server
+/// does not push it until somebody over there pastes.
+#[tokio::test]
+async fn the_extension_holds_the_text_until_it_is_asked_for() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.hold_clipboard = true;
+    let mut list = vec![encoding::PSEUDO_EXTENDED_CLIPBOARD];
+    list.extend_from_slice(ALL);
+    c.set_encodings(&list).await.unwrap();
+
+    // The server opens with what it can take.
+    c.next_clipboard().await.unwrap();
+    let caps = c.clip_messages.first().expect("the server's caps");
+    assert!(caps.answers(msg::clipboard::action::PROVIDE), "{caps:?}");
+    assert!(caps.answers(msg::clipboard::action::REQUEST), "{caps:?}");
+
+    c.clipboard_caps().await.unwrap();
+    // The caps have to land before the copy, or the server answers the way
+    // it does for a client that has said nothing yet.
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+
+    rig.clip.copy("héllo ✓");
+    c.next_clipboard().await.unwrap();
+    assert_eq!(
+        c.clip_messages.last(),
+        Some(&ClipboardMessage::Notify(msg::clipboard::format::TEXT)),
+        "a copy is announced, not sent"
+    );
+    assert!(c.clip_text.is_empty(), "and nothing was sent with it");
+
+    // Now somebody pastes.
+    c.clipboard_request().await.unwrap();
+    assert_eq!(c.next_clipboard_text().await.unwrap(), "héllo ✓");
+}
+
+/// Client to desk over the extension, with the same string the plain
+/// message cannot carry.
+#[tokio::test]
+async fn a_client_provides_utf8_and_the_desk_gets_all_of_it() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    let mut list = vec![encoding::PSEUDO_EXTENDED_CLIPBOARD];
+    list.extend_from_slice(ALL);
+    c.set_encodings(&list).await.unwrap();
+    // The server's own caps come first, unasked, as soon as it sees the
+    // pseudo-encoding named.
+    c.next_clipboard().await.unwrap();
+    c.clipboard_caps().await.unwrap();
+
+    // The long way round: say something was copied, wait to be asked, send
+    // it. Which is what a real viewer does.
+    c.clipboard_notify().await.unwrap();
+    c.next_clipboard().await.unwrap();
+    assert_eq!(
+        c.clip_messages.last(),
+        Some(&ClipboardMessage::Request(msg::clipboard::format::TEXT)),
+        "the server asks for what a client says it has"
+    );
+    c.clipboard_provide("héllo ✓").await.unwrap();
+    rig.until(|| rig.clip.written() == ["héllo ✓"]).await;
+}
+
+/// A client that pastes its own text back does not get it handed to it
+/// again, which is the loop every clipboard bridge has to break somewhere.
+#[tokio::test]
+async fn a_clients_own_text_is_not_sent_back_to_it() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.set_encodings(ALL).await.unwrap();
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+
+    c.cut_text("round and round").await.unwrap();
+    rig.until(|| rig.clip.written() == ["round and round"]).await;
+    // The platform reports it back, as every platform does.
+    rig.clip.copy("round and round");
+    // Then something else happens, which the client should hear about.
+    rig.clip.copy("but this is new");
+
+    assert_eq!(c.next_clipboard_text().await.unwrap(), "but this is new");
+    assert_eq!(c.clip_text, ["but this is new"], "and only that");
+}
+
+/// Two clients see the same desk, and one client's paste reaches the other.
+#[tokio::test]
+async fn the_desks_clipboard_reaches_every_client() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut a = Client::connect(rig.addr, None).await.unwrap();
+    let mut b = Client::connect(rig.addr, None).await.unwrap();
+    for c in [&mut a, &mut b] {
+        c.set_encodings(ALL).await.unwrap();
+        c.request_all(false).await.unwrap();
+        c.next_update().await.unwrap();
+    }
+
+    rig.clip.copy("for both of them");
+    assert_eq!(a.next_clipboard_text().await.unwrap(), "for both of them");
+    assert_eq!(b.next_clipboard_text().await.unwrap(), "for both of them");
+
+    // And the same word copied twice is two changes, not one: a session
+    // watching the text alone would sit on the second.
+    rig.clip.copy("for both of them");
+    assert_eq!(a.next_clipboard_text().await.unwrap(), "for both of them");
+    assert_eq!(b.next_clipboard_text().await.unwrap(), "for both of them");
+}
+
+/// A peek is answered with what is held, and nothing is sent for it.
+#[tokio::test]
+async fn a_peek_says_what_is_held_without_sending_it() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.hold_clipboard = true;
+    let mut list = vec![encoding::PSEUDO_EXTENDED_CLIPBOARD];
+    list.extend_from_slice(ALL);
+    c.set_encodings(&list).await.unwrap();
+    c.next_clipboard().await.unwrap();
+    c.clipboard_caps().await.unwrap();
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+
+    // Nothing copied yet, so the answer names no formats at all.
+    c.clipboard_peek().await.unwrap();
+    c.next_clipboard().await.unwrap();
+    assert_eq!(c.clip_messages.last(), Some(&ClipboardMessage::Notify(0)));
+
+    rig.clip.copy("held back");
+    c.next_clipboard().await.unwrap();
+    c.clipboard_peek().await.unwrap();
+    c.next_clipboard().await.unwrap();
+    assert_eq!(
+        c.clip_messages.last(),
+        Some(&ClipboardMessage::Notify(msg::clipboard::format::TEXT))
+    );
+    assert!(c.clip_text.is_empty(), "a peek sends nothing");
+}
+
+/// A clipboard change with a still screen is still seen, because the capture
+/// thread asks after every wait rather than after every frame.
+#[tokio::test]
+async fn a_copy_with_nothing_moving_on_screen_still_arrives() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    c.set_encodings(ALL).await.unwrap();
+    c.request_all(false).await.unwrap();
+    c.next_update().await.unwrap();
+
+    let before = rig.shared.seq();
+    rig.clip.copy("nothing is moving");
+    assert_eq!(c.next_clipboard_text().await.unwrap(), "nothing is moving");
+    assert_eq!(rig.shared.seq(), before, "and no frame was drawn for it");
+}
+
+/// A paste from a real browser, which is not the shape this server's own
+/// writer makes.
+///
+/// noVNC's deflater is flushed and never finished, because it carries on
+/// into the next message: no final block, no Adler-32 trailer. Reading it
+/// to the end of the stream reports a truncation that is not one, and the
+/// session was dropped on every paste. Found with noVNC in a browser
+/// against the release binary.
+#[tokio::test]
+async fn a_paste_from_novnc_reaches_the_desk_and_the_session_lives() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    let mut list = vec![encoding::PSEUDO_EXTENDED_CLIPBOARD];
+    list.extend_from_slice(ALL);
+    c.set_encodings(&list).await.unwrap();
+    c.next_clipboard().await.unwrap();
+    c.clipboard_caps().await.unwrap();
+
+    c.clipboard_provide_flushed("probe ✓ two").await.unwrap();
+    rig.until(|| rig.clip.written() == ["probe ✓ two"]).await;
+
+    // And the session is still there, which is the other half of it.
+    rig.frames(1).await;
+    c.request_all(true).await.unwrap();
+    c.next_update().await.unwrap();
+    assert_eq!(c.fb.data(), rig.picture());
+}
+
+/// A clipboard body this end cannot read costs the message and not the
+/// session. Everything a client sends after it still works.
+#[tokio::test]
+async fn an_unreadable_clipboard_body_does_not_end_the_session() {
+    let rig = Rig::start(None).await;
+    rig.frames(1).await;
+    let mut c = Client::connect(rig.addr, None).await.unwrap();
+    let mut list = vec![encoding::PSEUDO_EXTENDED_CLIPBOARD];
+    list.extend_from_slice(ALL);
+    c.set_encodings(&list).await.unwrap();
+    c.next_clipboard().await.unwrap();
+
+    // A provide whose stream is noise, a provide that stops halfway
+    // through what its own length promised, a caps naming two formats and
+    // carrying one size, and a body too short to hold its own flags.
+    let provide = (msg::clipboard::action::PROVIDE | msg::clipboard::format::TEXT).to_be_bytes();
+    let mut noise = provide.to_vec();
+    noise.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    let mut half = msg::clipboard_provide_text("a string of some length");
+    half.truncate(provide.len() + 4);
+    let mut caps =
+        (msg::clipboard::action::CAPS | msg::clipboard::format::TEXT | msg::clipboard::format::HTML)
+            .to_be_bytes()
+            .to_vec();
+    caps.extend_from_slice(&4096u32.to_be_bytes());
+    for body in [noise, half, caps, vec![0, 0, 0]] {
+        c.clipboard_body(&body).await.unwrap();
+    }
+
+    // Nothing was put on the desk, and the session carried on.
+    c.clipboard_provide("and now a good one").await.unwrap();
+    rig.until(|| rig.clip.written() == ["and now a good one"]).await;
+    rig.frames(1).await;
+    c.request_all(true).await.unwrap();
+    c.next_update().await.unwrap();
+    assert_eq!(c.fb.data(), rig.picture());
 }

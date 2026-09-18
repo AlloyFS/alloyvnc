@@ -24,10 +24,14 @@ pub mod keysym;
 #[cfg(windows)]
 pub mod capture;
 #[cfg(windows)]
+pub mod clipboard;
+#[cfg(windows)]
 pub mod input;
 
 #[cfg(windows)]
 pub use capture::DxgiCapture;
+#[cfg(windows)]
+pub use clipboard::WinClipboard;
 #[cfg(windows)]
 pub use input::WinInput;
 

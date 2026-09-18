@@ -48,6 +48,7 @@ name = "alloyvnc-proto"
 version = "0.1.0-alpha.1"
 dependencies = [
  "des",
+ "flate2",
  "rand",
  "thiserror",
 ]

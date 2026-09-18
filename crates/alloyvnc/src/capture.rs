@@ -41,14 +41,28 @@ pub fn spawn(shared: Arc<Shared>, mut capture: Box<dyn Capture>, stop: Arc<Atomi
             let mut totals = Totals::default();
             let mut totals_at = Instant::now();
             while !stop.load(Ordering::Relaxed) {
-                match capture.wait(WAIT_SLICE) {
-                    Ok(false) => continue,
-                    Ok(true) => {}
+                let ready = match capture.wait(WAIT_SLICE) {
+                    Ok(ready) => ready,
                     Err(e) => {
                         tracing::warn!(error = %e, "capture wait failed; retrying");
                         std::thread::sleep(RETRY_AFTER);
                         continue;
                     }
+                };
+
+                // Asked after every wait, frame or no frame: somebody can
+                // copy a word without the screen changing at all, and a
+                // clipboard that only moved when the picture did would sit
+                // on it until something else happened.
+                if let Some(text) = shared.clipboard.lock().changed() {
+                    tracing::debug!(bytes = text.len(), "clipboard from the desk");
+                    shared.clip.send_modify(|clip| {
+                        clip.seq += 1;
+                        clip.text = text;
+                    });
+                }
+                if !ready {
+                    continue;
                 }
                 // The numbers come out of the locked section and are
                 // logged outside it: a session waiting on the framebuffer

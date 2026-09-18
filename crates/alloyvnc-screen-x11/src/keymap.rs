@@ -28,6 +28,50 @@ pub struct Key {
 /// NoSymbol: the keycode types nothing in that position.
 const NONE: u32 = 0;
 
+/// What Shift has to do around one keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shift {
+    /// Nothing: what the client is holding is what the key wants.
+    Leave,
+    /// Press it for the keystroke and let go after. The keysym is only on
+    /// the shifted level of its key and the client is not holding Shift,
+    /// which is every capital from a client that sends the shifted keysym
+    /// without the key.
+    Press,
+    /// Let go for the keystroke and press it again after. The keysym is on
+    /// the unshifted level and the client is holding Shift, so the key on
+    /// its own would give the shifted keysym instead: a client holding
+    /// Shift and sending `1` would type `!`.
+    Release,
+}
+
+pub fn shift_for(wants_shift: bool, held: bool) -> Shift {
+    match (wants_shift, held) {
+        (true, false) => Shift::Press,
+        (false, true) => Shift::Release,
+        _ => Shift::Leave,
+    }
+}
+
+/// The keycodes this layout leaves free.
+///
+/// A keycode whose every level is NoSymbol types nothing, so binding a
+/// keysym to it takes nothing away from whoever is at the desk. They are
+/// what [`X11Input`] lends to a keysym the layout has no key for at all.
+///
+/// [`X11Input`]: crate::X11Input
+pub fn spares(keysyms: &[u32], per_keycode: usize, min_keycode: u8) -> Vec<u8> {
+    if per_keycode == 0 {
+        return Vec::new();
+    }
+    keysyms
+        .chunks(per_keycode)
+        .enumerate()
+        .filter(|(_, level)| level.iter().all(|&sym| sym == NONE))
+        .filter_map(|(i, _)| u8::try_from(usize::from(min_keycode) + i).ok())
+        .collect()
+}
+
 /// Build the keysym-to-key map from a GetKeyboardMapping reply.
 ///
 /// The unshifted column is walked before the shifted one, so a keysym a
@@ -92,6 +136,48 @@ fn upper_case(keysym: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four cases, of which one was missing: a client holding Shift and
+    /// asking for a keysym that sits on the unshifted level.
+    #[test]
+    fn shift_is_pressed_or_let_go_of_to_match_the_keysym() {
+        // A capital from a client that sends the shifted keysym without
+        // holding the key.
+        assert_eq!(shift_for(true, false), Shift::Press);
+        // A digit from a client that is holding Shift for its own reasons.
+        // Without this the key gives the shifted keysym: `1` types `!`.
+        assert_eq!(shift_for(false, true), Shift::Release);
+        // And the two that need nothing.
+        assert_eq!(shift_for(true, true), Shift::Leave);
+        assert_eq!(shift_for(false, false), Shift::Leave);
+    }
+
+    /// A keycode is spare only when every level of it is NoSymbol. One
+    /// symbol anywhere on the key means somebody at the desk types with it.
+    #[test]
+    fn spare_keycodes_are_the_ones_that_type_nothing() {
+        // Four keycodes from 8, two symbols each: a, A / nothing / nothing
+        // but only on the second level / z, Z.
+        let keysyms = [
+            0x61, 0x41, // 8: a A
+            0, 0, // 9: spare
+            0, 0x5f, // 10: types an underscore with Shift, so not spare
+            0x7a, 0x5a, // 11: z Z
+        ];
+        assert_eq!(spares(&keysyms, 2, 8), [9]);
+
+        // A layout that reports no symbols per keycode has no spares rather
+        // than every keycode: dividing by it would panic.
+        assert!(spares(&keysyms, 0, 8).is_empty());
+
+        // The whole keyboard free, which is what an empty mapping looks
+        // like, and the keycodes come back in order from the minimum.
+        assert_eq!(spares(&[0; 8], 2, 100), [100, 101, 102, 103]);
+
+        // A keycode past 255 cannot be named in the protocol, so a mapping
+        // that would run off the end stops rather than wrapping.
+        assert_eq!(spares(&[0; 8], 2, 254), [254, 255]);
+    }
 
     /// Where a keysym landed, as a pair, so an assertion is one line.
     fn at(map: &HashMap<u32, Key>, keysym: u32) -> Option<(u8, bool)> {

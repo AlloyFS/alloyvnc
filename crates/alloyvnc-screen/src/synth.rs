@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::{Capture, CaptureError, CursorShape, Frame, Framebuffer, Move, Rect, Region};
+use crate::{Capture, CaptureError, Clipboard, CursorShape, Frame, Framebuffer, Move, Rect, Region};
 
 /// Hands out frames on request rather than on a clock, so a test controls
 /// exactly when the picture changes.
@@ -418,5 +418,57 @@ mod tests {
         assert_eq!(frame.damage.bounds(), fb.bounds(), "first frame is all damage");
         assert!(frame.cursor.is_some(), "first frame carries the pointer");
         assert!(!s.wait(Duration::from_millis(5)).unwrap());
+    }
+}
+
+/// A clipboard with no desk behind it, for tests on any machine.
+///
+/// Both directions are visible from outside: [`copy`](FakeClipboard::copy)
+/// plays somebody at the desk putting text on it, and
+/// [`written`](FakeClipboard::written) says what the server has pasted onto
+/// it. Cloning one shares the same clipboard, so a test can hold a handle
+/// while the capture thread holds the other.
+#[derive(Clone, Default)]
+pub struct FakeClipboard {
+    inner: Arc<Mutex<Fake>>,
+}
+
+#[derive(Default)]
+struct Fake {
+    /// Put there by the desk and not yet reported.
+    fresh: Option<String>,
+    /// Everything the server has put on it, oldest first.
+    written: Vec<String>,
+}
+
+impl FakeClipboard {
+    pub fn new() -> FakeClipboard {
+        FakeClipboard::default()
+    }
+
+    /// Somebody at the desk copied something.
+    pub fn copy(&self, text: impl Into<String>) {
+        self.lock().fresh = Some(text.into());
+    }
+
+    /// What the server has pasted onto the desk, oldest first.
+    pub fn written(&self) -> Vec<String> {
+        self.lock().written.clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Fake> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Clipboard for FakeClipboard {
+    fn changed(&mut self) -> Option<String> {
+        self.lock().fresh.take()
+    }
+
+    fn set(&mut self, text: &str) {
+        // Deliberately not reported back by `changed`: a clipboard that
+        // echoed its own writes would send every paste round again.
+        self.lock().written.push(text.to_owned());
     }
 }

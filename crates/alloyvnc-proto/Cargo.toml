@@ -11,5 +11,6 @@ workspace = true
 
 [dependencies]
 des.workspace = true
+flate2.workspace = true
 rand.workspace = true
 thiserror.workspace = true

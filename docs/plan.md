@@ -473,3 +473,56 @@ Things measured or observed that changed the plan, newest last.
   `C:\Users\Kyle\.claude\chrome\bench\count-proxy.py` is his to run:
   `python count-proxy.py 5902 127.0.0.1:5900`, the viewer pointed at 5902,
   and the same again at 5901 with alloyvnc serving.
+- **2026-09-18, the clipboard, four things found by running it.** On
+  Windows the clipboard sequence number does not move until
+  CloseClipboard, so reading it before the handle is closed records the
+  old value and the server's own write looks like somebody else's; the
+  round-trip test failed on exactly that, and the client that pasted would
+  have had its text handed back a tenth of a second later. On X11 nothing
+  leaves the connection until it is flushed: a ConvertSelection and the
+  SelectionNotify sat in the output buffer and the live test caught it on
+  the first run. A modern X server keeps at most four core keysyms per key
+  (ChangeKeyboardMapping is translated into XKB), so a lent keycode filled
+  to seven levels read back with three NoSymbols and would not clear; two
+  levels, and the restore verified with xmodmap after the process exits.
+  And a display has one clipboard while cargo runs tests in parallel, so
+  the two live X11 tests fought each other and are one test now. Measured:
+  GetClipboardSequenceNumber costs 1.14 µs a call here (100k iterations,
+  release), eleven microseconds of every second at the 100 ms cadence; a
+  test asserts under 10 µs so a poll that has become a round trip is
+  noticed. Proved end to end against a client sharing no code with the
+  repo: U+00E9 and U+2713 survived a UTF-16 clipboard, a deflated provide
+  and the socket.
+- **2026-09-18, the clipboard against noVNC, two more.** noVNC writes its
+  provide's zlib stream with a full flush and never finishes it: no final
+  block, no Adler-32. A reader that inflates to the end of the stream
+  rejects every paste from noVNC; the one that works, TigerVNC's, inflates
+  exactly the bytes the embedded lengths call for and never asks for the
+  end. The first build here did the former and, worse, let the rejection
+  end the session; a bad clipboard message is a dropped message. Desk to
+  browser was proved on the wire meanwhile: noVNC's `_writeClipboard`
+  received "probe ✓ two" with the check mark intact. Its panel stayed
+  empty because noVNC hands received text to the browser's asynchronous
+  clipboard API first and only falls back to the panel when that API is
+  absent; a hidden tab cannot write the browser clipboard, so a check from
+  the rig reads the text at noVNC's own function, not in the panel. With
+  the reader fixed, both directions hold against noVNC in the rig: "desk ✓
+  café" reached noVNC's function, "from noVNC ✓ 42" reached the desk's
+  clipboard with U+2713 intact, and the session stayed up through both.
+- **2026-09-18, a flush is not an acknowledgement.** The X11 input side
+  lends a spare keycode to a keysym the layout cannot type and gives it
+  back on the way out. Its Drop flushed the ChangeKeyboardMapping and
+  closed the connection; a flush says the bytes left this process, not
+  that the server acted on them, so the request could still be in flight
+  when the socket went and the keycode stayed bound on the user's display
+  for the rest of the X session. Intermittent, which is why earlier runs
+  looked clean. The restore is a checked request now, which round-trips,
+  and the live test clears any leftover before it starts. A process killed
+  outright still leaks one keycode, since nothing outside it records the
+  loan; on the backlog.
+- **2026-09-18, the desk's clipboard is contended.** During the rig check,
+  PowerShell's Set-Clipboard once reported "Requested Clipboard operation
+  did not succeed" and then succeeded: two processes wanted the clipboard
+  in the same instant, one of them this server reading the change. Any
+  clipboard code on Windows has to retry OpenClipboard a few times, which
+  ours does; other programs may not.

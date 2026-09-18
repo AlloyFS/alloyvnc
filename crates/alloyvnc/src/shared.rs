@@ -6,11 +6,11 @@ use std::time::Instant;
 
 use alloyvnc_encode::{CursorShape, Framebuffer};
 use alloyvnc_region::{Move, Rect, Region};
-use alloyvnc_screen::Input;
+use alloyvnc_screen::{Clipboard, Input};
 
 use crate::stats::{CaptureStats, SessionStats};
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// "Frame `seq` changed this." Every session folds these into its own
 /// pending state; a session that falls behind the channel marks the whole
@@ -29,6 +29,17 @@ pub struct FrameEvent {
     pub resized: bool,
 }
 
+/// What the desk's clipboard holds, and a count that moves on every change.
+///
+/// The count is what a session watches rather than the text: somebody who
+/// copies the same word twice has changed the clipboard twice, and a client
+/// that asked to be told about changes should hear about both.
+#[derive(Clone, Debug, Default)]
+pub struct Clip {
+    pub seq: u64,
+    pub text: String,
+}
+
 pub struct Shared {
     /// The desktop name a viewer shows in its title bar.
     pub name: String,
@@ -44,6 +55,11 @@ pub struct Shared {
     /// Frames applied so far.
     pub seq: AtomicU64,
     pub input: Mutex<Box<dyn Input>>,
+    /// The desk's clipboard. The capture thread asks it what changed; a
+    /// session pushes a client's text onto it.
+    pub clipboard: Mutex<Box<dyn Clipboard>>,
+    /// The last thing the desk copied, for every session to see at once.
+    pub clip: watch::Sender<Clip>,
     /// Every live session's counters, for the stats endpoint. Holding a
     /// second reference rather than reaching into the session means reading
     /// them never waits on whatever that session is doing.
@@ -56,8 +72,15 @@ impl Shared {
     /// told to redraw, which costs less than the queue would.
     const FRAME_BACKLOG: usize = 64;
 
-    pub fn new(name: impl Into<String>, width: u32, height: u32, input: Box<dyn Input>) -> Arc<Shared> {
+    pub fn new(
+        name: impl Into<String>,
+        width: u32,
+        height: u32,
+        input: Box<dyn Input>,
+        clipboard: Box<dyn Clipboard>,
+    ) -> Arc<Shared> {
         let (frames, _) = broadcast::channel(Self::FRAME_BACKLOG);
+        let (clip, _) = watch::channel(Clip::default());
         Arc::new(Shared {
             name: name.into(),
             fb: RwLock::new(Framebuffer::new(width, height)),
@@ -66,6 +89,8 @@ impl Shared {
             frames,
             seq: AtomicU64::new(0),
             input: Mutex::new(input),
+            clipboard: Mutex::new(clipboard),
+            clip,
             sessions: Mutex::new(Vec::new()),
             capture: CaptureStats::default(),
         })

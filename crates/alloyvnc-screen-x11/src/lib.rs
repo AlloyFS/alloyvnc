@@ -26,9 +26,13 @@ pub mod keymap;
 #[cfg(target_os = "linux")]
 pub mod capture;
 #[cfg(target_os = "linux")]
+pub mod clipboard;
+#[cfg(target_os = "linux")]
 pub mod input;
 
 #[cfg(target_os = "linux")]
 pub use capture::X11Capture;
+#[cfg(target_os = "linux")]
+pub use clipboard::X11Clipboard;
 #[cfg(target_os = "linux")]
 pub use input::X11Input;

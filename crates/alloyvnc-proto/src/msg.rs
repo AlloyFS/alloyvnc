@@ -77,8 +77,20 @@ pub enum ClientMessage {
     },
     /// Latin-1 text, decoded.
     ClientCutText(String),
-    /// An Extended Clipboard message (negative length in ClientCutText), raw.
-    ExtendedClipboard(Vec<u8>),
+    /// An Extended Clipboard message (negative length in ClientCutText).
+    ExtendedClipboard(ClipboardMessage),
+    /// An Extended Clipboard body this build could not read, with whatever
+    /// its flag word was.
+    ///
+    /// A message rather than an error on purpose. The far side is still
+    /// speaking RFB correctly and everything after this will parse; a
+    /// clipboard that will not decode is worth a line in a log and nothing
+    /// more. Hanging up on it drops somebody's whole session over a paste,
+    /// which is what happened the first time noVNC pasted into this server.
+    UnreadableClipboard {
+        flags: u32,
+        why: Error,
+    },
     EnableContinuousUpdates {
         enable: bool,
         x: u16,
@@ -220,7 +232,13 @@ pub fn parse_client(buf: &[u8]) -> Result<Option<(ClientMessage, usize)>, Error>
             }
             let raw = need!(c.take(n));
             if extended {
-                ClientMessage::ExtendedClipboard(raw.to_vec())
+                match parse_clipboard(raw) {
+                    Ok(message) => ClientMessage::ExtendedClipboard(message),
+                    Err(why) => ClientMessage::UnreadableClipboard {
+                        flags: raw.first_chunk::<4>().map_or(0, |b| u32::from_be_bytes(*b)),
+                        why,
+                    },
+                }
             } else {
                 ClientMessage::ClientCutText(latin1_to_string(raw))
             }
@@ -320,6 +338,277 @@ pub fn string_to_latin1(text: &str) -> Vec<u8> {
     text.chars()
         .map(|ch| u8::try_from(u32::from(ch)).unwrap_or(b'?'))
         .collect()
+}
+
+// The Extended Clipboard extension, pseudo-encoding 0xc0a1e5ce.
+//
+// The plain cut-text message says one thing and says it badly: a Latin-1
+// string, pushed at the far side whether or not anybody there wants it. The
+// extension reuses the same message with the length written negative, and
+// puts a small protocol in the body. Each side opens with what it can take
+// (caps). After that a copy is announced (notify), fetched when somebody
+// actually pastes (request), and carried UTF-8 and compressed (provide). So
+// a megabyte on the clipboard costs four bytes until it is wanted.
+
+/// The bits an Extended Clipboard body opens with.
+pub mod clipboard {
+    /// The action bits. Every message but caps carries exactly one; a caps
+    /// message sets its own bit plus one for every action it will answer.
+    pub mod action {
+        pub const CAPS: u32 = 1 << 24;
+        pub const REQUEST: u32 = 1 << 25;
+        pub const PEEK: u32 = 1 << 26;
+        pub const NOTIFY: u32 = 1 << 27;
+        pub const PROVIDE: u32 = 1 << 28;
+        /// Everything this build knows how to answer.
+        pub const ALL: u32 = CAPS | REQUEST | PEEK | NOTIFY | PROVIDE;
+    }
+
+    /// The format bits, lowest first, which is the order their sizes appear
+    /// in a caps body and their data in a provide.
+    pub mod format {
+        pub const TEXT: u32 = 1 << 0;
+        pub const RTF: u32 = 1 << 1;
+        pub const HTML: u32 = 1 << 2;
+        pub const DIB: u32 = 1 << 3;
+        pub const FILES: u32 = 1 << 4;
+        /// The five that are defined. Bits 5 to 23 are reserved, and a peer
+        /// that sets one is answered by stepping over it, not by refusing.
+        pub const ALL: u32 = TEXT | RTF | HTML | DIB | FILES;
+        /// Every bit a format may occupy, known or not. A provide carries a
+        /// length and a block for each one set, so the walk over a body has
+        /// to cover all of them or it loses its place.
+        pub const EVERY: u32 = 0x00ff_ffff;
+    }
+}
+
+/// One Extended Clipboard message, whichever way it was going.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardMessage {
+    /// What the far side can take, and the most it will accept of each
+    /// format it named, lowest format bit first.
+    Caps {
+        formats: u32,
+        actions: u32,
+        sizes: Vec<u32>,
+    },
+    /// Send what is held, in any of these formats.
+    Request(u32),
+    /// Say what is held, without sending it.
+    Peek(u32),
+    /// Something was copied over there, and these formats are available.
+    Notify(u32),
+    /// Here it is. Only text is unpacked; another format is stepped over
+    /// rather than refused.
+    Provide { text: Option<String> },
+    /// An action this build does not know. The extension is meant to grow,
+    /// so one of those is something to ignore rather than to hang up over.
+    Unknown(u32),
+}
+
+impl ClipboardMessage {
+    /// Whether a peer that sent this caps message will answer `action`.
+    pub fn answers(&self, action: u32) -> bool {
+        match self {
+            ClipboardMessage::Caps { actions, .. } => actions & action != 0,
+            _ => false,
+        }
+    }
+}
+
+/// Read an Extended Clipboard body: the bytes after the negative length.
+pub fn parse_clipboard(body: &[u8]) -> Result<ClipboardMessage, Error> {
+    let head = body
+        .first_chunk::<4>()
+        .ok_or(Error::Truncated("extended clipboard"))?;
+    let flags = u32::from_be_bytes(*head);
+    let rest = &body[4..];
+    let formats = flags & clipboard::format::ALL;
+    let actions = flags & clipboard::action::ALL;
+
+    // Caps is the one message with more than one action bit set, so it is
+    // tested for rather than matched on.
+    if actions & clipboard::action::CAPS != 0 {
+        // One size per format bit the peer named, in bit order. A peer
+        // naming a format this build has never heard of still owes its four
+        // bytes, so the count is over every bit set below 24.
+        let named = (flags & clipboard::format::EVERY).count_ones() as usize;
+        let want = named * 4;
+        if rest.len() < want {
+            return Err(Error::Truncated("extended clipboard caps"));
+        }
+        let sizes = rest[..want]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_be_bytes(*b))
+            .collect();
+        return Ok(ClipboardMessage::Caps {
+            formats,
+            actions,
+            sizes,
+        });
+    }
+
+    match actions {
+        clipboard::action::REQUEST => Ok(ClipboardMessage::Request(formats)),
+        clipboard::action::PEEK => Ok(ClipboardMessage::Peek(formats)),
+        clipboard::action::NOTIFY => Ok(ClipboardMessage::Notify(formats)),
+        clipboard::action::PROVIDE => Ok(ClipboardMessage::Provide {
+            text: provided_text(flags, rest)?,
+        }),
+        _ => Ok(ClipboardMessage::Unknown(flags)),
+    }
+}
+
+/// Inflate a provide body and pull the text out of it, if it holds any.
+fn provided_text(flags: u32, rest: &[u8]) -> Result<Option<String>, Error> {
+    use std::io::Read;
+
+    // Read a block at a time and never to the end of the stream. Every
+    // writer in the wild flushes its deflater rather than finishing it,
+    // because the same deflater carries on into the next message: there is
+    // no final block and no Adler-32 trailer, and asking for the end
+    // reports a truncation that is not one. The lengths embedded in the
+    // data say how much there is, which is what TigerVNC's reader goes by
+    // and all the extension actually promises. noVNC pastes died here.
+    let mut z = flate2::read::ZlibDecoder::new(rest);
+    let mut text = None;
+    // A clipboard that inflates to more than the plain message's limit is
+    // not a clipboard, and the budget is over the whole body rather than
+    // each format: twenty-four megabyte-long blocks out of a few hundred
+    // compressed bytes is a cheap way to ask for memory.
+    let mut budget = MAX_CUT_TEXT;
+    for bit in 0..24u32 {
+        if flags & (1 << bit) == 0 {
+            continue;
+        }
+        let mut head = [0u8; 4];
+        z.read_exact(&mut head).map_err(inflate_trouble)?;
+        let len = u32::from_be_bytes(head) as usize;
+        if len > budget {
+            return Err(Error::TooLong {
+                what: "extended clipboard provide",
+                len,
+                limit: MAX_CUT_TEXT,
+            });
+        }
+        budget -= len;
+        // Read even for a format this build does not keep: the blocks are
+        // back to back, so stepping over one means reading past it.
+        let mut data = vec![0u8; len];
+        z.read_exact(&mut data).map_err(inflate_trouble)?;
+        if 1 << bit == clipboard::format::TEXT {
+            text = Some(clipboard_text(&data));
+        }
+    }
+    Ok(text)
+}
+
+/// Tell a stream that stops early from one that is not a stream at all.
+///
+/// The first is a peer that said it would send more than it did, which is a
+/// message to drop; the second is noise, which is the same. They are kept
+/// apart because the log line is the first thing anybody reads when a
+/// clipboard stops working.
+fn inflate_trouble(e: std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        Error::Truncated("extended clipboard provide")
+    } else {
+        Error::Clipboard("the provide does not inflate")
+    }
+}
+
+/// The extension's text format: UTF-8, line ends LF, and a terminating null
+/// counted in the length.
+///
+/// The null is dropped if it is there and not missed if it is not, and bytes
+/// that are not UTF-8 are replaced rather than refused: a clipboard arriving
+/// with a question mark in it beats one that does not arrive.
+fn clipboard_text(data: &[u8]) -> String {
+    let body = data.strip_suffix(b"\0").unwrap_or(data);
+    String::from_utf8_lossy(body).replace("\r\n", "\n")
+}
+
+/// A caps body: every format and action this side will answer, then the most
+/// it will take of each format, lowest bit first.
+pub fn clipboard_caps(formats: u32, actions: u32, sizes: &[u32]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + sizes.len() * 4);
+    let flags = formats | actions | clipboard::action::CAPS;
+    body.extend_from_slice(&flags.to_be_bytes());
+    for size in sizes {
+        body.extend_from_slice(&size.to_be_bytes());
+    }
+    body
+}
+
+/// A request, peek or notify body, which is the flags and nothing else.
+pub fn clipboard_flags(action: u32, formats: u32) -> Vec<u8> {
+    (action | formats).to_be_bytes().to_vec()
+}
+
+/// A provide body carrying text: the flags, then one zlib stream holding a
+/// length and the bytes for each format named.
+pub fn clipboard_provide_text(text: &str) -> Vec<u8> {
+    use std::io::Write;
+
+    let body = (clipboard::action::PROVIDE | clipboard::format::TEXT)
+        .to_be_bytes()
+        .to_vec();
+    let flat = provide_block(text);
+    // Level 6 rather than the 1 the framebuffer's streams use. A clipboard
+    // is kilobytes and happens when somebody presses a key, so the time the
+    // extra levels cost is time nothing else wanted.
+    let mut z = flate2::write::ZlibEncoder::new(body, flate2::Compression::new(6));
+    z.write_all(&flat).expect("a Vec takes every byte");
+    z.finish().expect("a Vec takes every byte")
+}
+
+/// The same body with the stream flushed rather than finished.
+///
+/// What every writer in the wild produces: noVNC's Deflator and TigerVNC's
+/// ZlibOutStream both flush and stop, because the same deflater carries on
+/// into the next message. Here so the tests can send that shape. Nothing in
+/// the server sends it, because a finished stream reads correctly for both
+/// kinds of reader and a flushed one only reads for the careful kind.
+pub fn clipboard_provide_text_flushed(text: &str) -> Vec<u8> {
+    let mut body = (clipboard::action::PROVIDE | clipboard::format::TEXT)
+        .to_be_bytes()
+        .to_vec();
+    let mut z = flate2::Compress::new(flate2::Compression::new(6), true);
+    let mut out = vec![0u8; text.len() + 64];
+    let flat = provide_block(text);
+    z.compress(&flat, &mut out, flate2::FlushCompress::Sync)
+        .expect("a buffer with room in it");
+    let wrote = z.total_out() as usize;
+    body.extend_from_slice(&out[..wrote]);
+    body
+}
+
+/// One format's block inside a provide: a length, the text, and the null
+/// the length counts.
+fn provide_block(text: &str) -> Vec<u8> {
+    let utf8 = text.replace("\r\n", "\n");
+    let mut flat = Vec::with_capacity(utf8.len() + 5);
+    flat.extend_from_slice(&((utf8.len() + 1) as u32).to_be_bytes());
+    flat.extend_from_slice(utf8.as_bytes());
+    flat.push(0);
+    flat
+}
+
+/// Wrap an Extended Clipboard body in a ServerCutText, with the negative
+/// length that tells it apart from a plain one.
+pub fn write_server_clipboard(out: &mut Vec<u8>, body: &[u8]) {
+    out.extend_from_slice(&[server_type::SERVER_CUT_TEXT, 0, 0, 0]);
+    out.extend_from_slice(&(-(body.len() as i32)).to_be_bytes());
+    out.extend_from_slice(body);
+}
+
+/// The same, going the other way.
+pub fn write_client_clipboard(out: &mut Vec<u8>, body: &[u8]) {
+    out.extend_from_slice(&[client_type::CLIENT_CUT_TEXT, 0, 0, 0]);
+    out.extend_from_slice(&(-(body.len() as i32)).to_be_bytes());
+    out.extend_from_slice(body);
 }
 
 // Client message writers: the test client's half, and what the parser tests
@@ -633,12 +922,186 @@ mod tests {
             }
         );
 
-        let mut out = vec![client_type::CLIENT_CUT_TEXT, 0, 0, 0];
-        out.extend_from_slice(&(-3i32).to_be_bytes());
-        out.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        // A negative length means the extension rather than a string.
+        let caps = clipboard_caps(
+            clipboard::format::TEXT,
+            clipboard::action::NOTIFY | clipboard::action::PROVIDE,
+            &[MAX_CUT_TEXT as u32],
+        );
+        let mut out = Vec::new();
+        write_client_clipboard(&mut out, &caps);
         assert_eq!(
             round_trip(&out),
-            ClientMessage::ExtendedClipboard(vec![0xaa, 0xbb, 0xcc])
+            ClientMessage::ExtendedClipboard(ClipboardMessage::Caps {
+                formats: clipboard::format::TEXT,
+                actions: clipboard::action::CAPS | clipboard::action::NOTIFY | clipboard::action::PROVIDE,
+                sizes: vec![MAX_CUT_TEXT as u32],
+            })
+        );
+    }
+
+    /// The extension's own bodies, each way round.
+    #[test]
+    fn extended_clipboard_bodies_round_trip() {
+        use clipboard::{action, format};
+
+        // Caps: the sizes are one per format bit, lowest first, and the
+        // actions come back as the peer named them.
+        let body = clipboard_caps(
+            format::TEXT | format::HTML,
+            action::REQUEST | action::NOTIFY | action::PROVIDE,
+            &[4096, 16],
+        );
+        assert_eq!(
+            parse_clipboard(&body).unwrap(),
+            ClipboardMessage::Caps {
+                formats: format::TEXT | format::HTML,
+                actions: action::CAPS | action::REQUEST | action::NOTIFY | action::PROVIDE,
+                sizes: vec![4096, 16],
+            }
+        );
+
+        // The three that are flags and nothing else.
+        for (action, expected) in [
+            (action::REQUEST, ClipboardMessage::Request(format::TEXT)),
+            (action::PEEK, ClipboardMessage::Peek(format::TEXT)),
+            (action::NOTIFY, ClipboardMessage::Notify(format::TEXT)),
+        ] {
+            let body = clipboard_flags(action, format::TEXT);
+            assert_eq!(body.len(), 4);
+            assert_eq!(parse_clipboard(&body).unwrap(), expected);
+        }
+
+        // Provide, which is the whole point: UTF-8 through, not Latin-1.
+        let body = clipboard_provide_text("héllo ✓");
+        assert_eq!(
+            parse_clipboard(&body).unwrap(),
+            ClipboardMessage::Provide {
+                text: Some("héllo ✓".into())
+            }
+        );
+    }
+
+    /// The same text, both ways out: the extension keeps it and the plain
+    /// message cannot. This is the difference the whole extension buys.
+    #[test]
+    fn the_plain_message_loses_what_the_extension_keeps() {
+        let mut plain = Vec::new();
+        write_server_cut_text(&mut plain, "héllo ✓");
+        // Latin-1 has an e-acute, in one byte, and has no tick at all.
+        assert_eq!(&plain[8..], b"h\xe9llo ?");
+        assert_eq!(latin1_to_string(&plain[8..]), "héllo ?");
+
+        let body = clipboard_provide_text("héllo ✓");
+        let ClipboardMessage::Provide { text } = parse_clipboard(&body).unwrap() else {
+            panic!("a provide");
+        };
+        assert_eq!(text.as_deref(), Some("héllo ✓"));
+    }
+
+    /// A format this build does not read still has its block stepped over,
+    /// or everything after it in the same provide is read at the wrong
+    /// offset.
+    #[test]
+    fn a_format_in_front_of_the_text_is_stepped_over() {
+        use std::io::Write;
+
+        use clipboard::{action, format};
+
+        // RTF is bit 1 and text is bit 0, so text comes first; put DIB
+        // (bit 3) after it, and a reserved bit 7 after that.
+        let flags = action::PROVIDE | format::TEXT | format::DIB | (1 << 7);
+        let mut body = flags.to_be_bytes().to_vec();
+        let mut flat = Vec::new();
+        for block in [&b"hello\0"[..], &b"\x89PNG"[..], &b"whatever this is"[..]] {
+            flat.extend_from_slice(&(block.len() as u32).to_be_bytes());
+            flat.extend_from_slice(block);
+        }
+        let mut z = flate2::write::ZlibEncoder::new(&mut body, flate2::Compression::new(6));
+        z.write_all(&flat).unwrap();
+        z.finish().unwrap();
+
+        assert_eq!(
+            parse_clipboard(&body).unwrap(),
+            ClipboardMessage::Provide {
+                text: Some("hello".into())
+            }
+        );
+    }
+
+    /// What a peer can get wrong, answered without dropping the session
+    /// where the extension allows it and refused where it does not.
+    #[test]
+    fn a_hostile_clipboard_body_is_refused_rather_than_believed() {
+        use clipboard::{action, format};
+
+        // Too short to hold its own flags.
+        assert!(matches!(
+            parse_clipboard(&[0, 0, 0]),
+            Err(Error::Truncated("extended clipboard"))
+        ));
+
+        // Caps naming two formats and carrying one size.
+        let mut body = (action::CAPS | format::TEXT | format::HTML)
+            .to_be_bytes()
+            .to_vec();
+        body.extend_from_slice(&4096u32.to_be_bytes());
+        assert!(matches!(
+            parse_clipboard(&body),
+            Err(Error::Truncated("extended clipboard caps"))
+        ));
+
+        // A provide whose stream is noise.
+        let mut body = (action::PROVIDE | format::TEXT).to_be_bytes().to_vec();
+        body.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        assert!(matches!(parse_clipboard(&body), Err(Error::Clipboard(_))));
+
+        // A provide whose length word runs past the data it inflated to.
+        let mut body = (action::PROVIDE | format::TEXT).to_be_bytes().to_vec();
+        let mut flat = 9_999u32.to_be_bytes().to_vec();
+        flat.extend_from_slice(b"short");
+        let mut z = flate2::write::ZlibEncoder::new(&mut body, flate2::Compression::new(6));
+        std::io::Write::write_all(&mut z, &flat).unwrap();
+        z.finish().unwrap();
+        assert!(matches!(
+            parse_clipboard(&body),
+            Err(Error::Truncated("extended clipboard provide"))
+        ));
+
+        // An action nobody here knows is ignored, not refused: the
+        // extension is meant to grow.
+        let body = clipboard_flags(1 << 29, format::TEXT);
+        assert_eq!(
+            parse_clipboard(&body).unwrap(),
+            ClipboardMessage::Unknown((1 << 29) | format::TEXT)
+        );
+    }
+
+    /// The shape every writer in the wild actually sends.
+    ///
+    /// noVNC's Deflator and TigerVNC's ZlibOutStream both flush the stream
+    /// and stop: there is no final block and no Adler-32 trailer, because
+    /// the same deflater is reused for the next message. A reader that asks
+    /// for the end of the stream is asking for something that is never
+    /// coming, and reads it as a truncation. Found against noVNC in a
+    /// browser, where the server dropped the session on every paste.
+    #[test]
+    fn a_provide_whose_stream_is_flushed_and_not_finished_still_reads() {
+        let body = clipboard_provide_text_flushed("paste from a browser ✓");
+        assert_eq!(
+            parse_clipboard(&body).unwrap(),
+            ClipboardMessage::Provide {
+                text: Some("paste from a browser ✓".into())
+            }
+        );
+
+        // And a finished one still reads, which is what this server sends.
+        let body = clipboard_provide_text("paste from here ✓");
+        assert_eq!(
+            parse_clipboard(&body).unwrap(),
+            ClipboardMessage::Provide {
+                text: Some("paste from here ✓".into())
+            }
         );
     }
 

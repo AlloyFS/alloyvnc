@@ -81,6 +81,37 @@ pub trait Input: Send {
     fn pointer(&mut self, x: u16, y: u16, buttons: u8);
 }
 
+/// The desk's clipboard, as much of it as a VNC server needs.
+///
+/// Text only. A desk's clipboard holds pictures, files and half a dozen
+/// private formats an application invented, and none of that crosses an RFB
+/// connection, so anything that is not text reads as nothing at all.
+///
+/// **Not echoing is the platform's job.** Writing to a clipboard makes it
+/// change, and a change is what [`changed`](Clipboard::changed) reports, so
+/// the naive pair sends every paste straight back to the client that sent
+/// it, which then pastes it again. An implementation has to remember what
+/// its own [`set`](Clipboard::set) wrote and keep quiet about it.
+pub trait Clipboard: Send {
+    /// Text the desk's clipboard now holds, if it has changed since the last
+    /// call. `None` when nothing changed, or when what it holds is not text.
+    fn changed(&mut self) -> Option<String>;
+
+    /// Put a client's text on the desk's clipboard.
+    fn set(&mut self, text: &str);
+}
+
+/// A clipboard for a screen that has no desk behind it.
+pub struct NullClipboard;
+
+impl Clipboard for NullClipboard {
+    fn changed(&mut self) -> Option<String> {
+        None
+    }
+
+    fn set(&mut self, _text: &str) {}
+}
+
 /// Swallows input, for a screen nothing can type into.
 pub struct NullInput;
 

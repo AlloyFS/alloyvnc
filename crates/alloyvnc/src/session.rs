@@ -18,7 +18,9 @@ use alloyvnc_encode::tight::{Spent, Tight};
 use alloyvnc_encode::zrle::Zrle;
 use alloyvnc_encode::{CursorShape, copyrect, cursor, raw};
 use alloyvnc_proto::handshake::{self, Flow, ServerInit, security};
-use alloyvnc_proto::msg::{self, ClientMessage, Screen, resize_reason, resize_status};
+use alloyvnc_proto::msg::{
+    self, ClientMessage, ClipboardMessage, Screen, clipboard, resize_reason, resize_status,
+};
 use alloyvnc_proto::{PixelFormat, auth, encoding};
 use alloyvnc_region::{Move, Rect, Region};
 use anyhow::{Context, Result, bail};
@@ -29,7 +31,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::flow::{Congestion, Limits};
-use crate::shared::{FrameEvent, Shared};
+use crate::shared::{Clip, FrameEvent, Shared};
 use crate::stats::SessionStats;
 
 /// Updates the writer may have queued before the session stops building
@@ -125,6 +127,9 @@ pub async fn run(
         held_fence: None,
         reader_paused: false,
         newest_frame: None,
+        clip_echo: None,
+        clip_ext: None,
+        clip_held: None,
         coder: Coder::Raw,
         choice: Choice {
             encoding: encoding::RAW,
@@ -302,6 +307,19 @@ fn is_gone(e: &anyhow::Error) -> bool {
     })
 }
 
+/// What a client said it can take over the Extended Clipboard extension.
+struct ClipPeer {
+    /// The actions it will answer.
+    actions: u32,
+    /// The formats it will accept.
+    formats: u32,
+    /// The most text it will take, from its own caps. Kept rather than
+    /// enforced for now: nothing here sends more than the megabyte the plain
+    /// message is capped at, and every client seen offers at least that.
+    #[allow(dead_code)]
+    text_max: u32,
+}
+
 struct Session {
     shared: Arc<Shared>,
     cfg: Arc<SessionConfig>,
@@ -346,6 +364,16 @@ struct Session {
     /// When the newest frame folded into `pending` was captured, so an
     /// update can say how old the freshest thing in it is.
     newest_frame: Option<Instant>,
+    /// Text this client sent to the desk, so the desk holding it a moment
+    /// later is not read as news and pushed straight back at it.
+    clip_echo: Option<String>,
+    /// What the client said it can take over the Extended Clipboard
+    /// extension, once it has said anything.
+    clip_ext: Option<ClipPeer>,
+    /// Text the desk holds that this client has been told about but has not
+    /// asked for. This is what the extension buys: a copied megabyte costs
+    /// four bytes until somebody over there actually pastes.
+    clip_held: Option<String>,
     /// How this client's rectangles are encoded, and what it asked for.
     coder: Coder,
     choice: Choice,
@@ -469,6 +497,10 @@ impl Session {
         // A handle of its own to wait for room on, so the wait does not hold
         // a borrow of the session that sending would need back.
         let tx = self.tx.clone();
+        // A watcher of its own, for the same reason: a select that held a
+        // borrow of the session here could not hand one to the frame
+        // receiver beside it.
+        let mut clip = self.shared.clip.subscribe();
         loop {
             let now = Instant::now();
             self.flow.expire(now);
@@ -537,10 +569,142 @@ impl Session {
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 },
+                moved = clip.changed() => {
+                    if moved.is_err() {
+                        // Only if the whole server is going down, since the
+                        // session holds the sender's owner. Stop watching
+                        // rather than spin on a closed channel.
+                        return Ok(());
+                    }
+                    let now = clip.borrow_and_update().clone();
+                    self.clip_moved(now);
+                }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(throttle_until.unwrap_or_else(Instant::now))),
                     if throttle_until.is_some() => {}
             }
         }
+    }
+
+    /// The desk's clipboard changed. Tell the client, in whichever way it
+    /// can hear.
+    fn clip_moved(&mut self, clip: Clip) {
+        // The desk holding what this client just sent is that client's own
+        // paste coming back round the loop. Not news.
+        if self.clip_echo.as_deref() == Some(clip.text.as_str()) {
+            return;
+        }
+        if clip.text.len() > msg::MAX_CUT_TEXT {
+            tracing::debug!(
+                peer = %self.peer,
+                bytes = clip.text.len(),
+                "clipboard past the limit; not sent"
+            );
+            return;
+        }
+        tracing::debug!(peer = %self.peer, seq = clip.seq, bytes = clip.text.len(), "clipboard out");
+        let mut buf = Vec::new();
+        match &self.clip_ext {
+            // The extension, and the client takes a notify: say that
+            // something was copied and wait to be asked for it.
+            Some(peer)
+                if peer.actions & clipboard::action::NOTIFY != 0
+                    && peer.formats & clipboard::format::TEXT != 0 =>
+            {
+                self.clip_held = Some(clip.text);
+                msg::write_server_clipboard(
+                    &mut buf,
+                    &msg::clipboard_flags(clipboard::action::NOTIFY, clipboard::format::TEXT),
+                );
+            }
+            // The extension, but it will not take a notify. Send it now,
+            // which still keeps the text whole.
+            Some(peer) if peer.formats & clipboard::format::TEXT != 0 => {
+                msg::write_server_clipboard(&mut buf, &msg::clipboard_provide_text(&clip.text));
+            }
+            // No extension. Latin-1, and anything outside it becomes a
+            // question mark, which is the whole of what the plain message
+            // can carry.
+            _ => msg::write_server_cut_text(&mut buf, &clip.text),
+        }
+        self.outbox.push_back(buf);
+    }
+
+    /// One Extended Clipboard message from the client.
+    fn extended_clipboard(&mut self, message: ClipboardMessage) {
+        match message {
+            ClipboardMessage::Caps {
+                formats,
+                actions,
+                sizes,
+            } => {
+                // The sizes are one per format bit, lowest first, so text's
+                // is the first of them whenever text is named at all.
+                let text_max = if formats & clipboard::format::TEXT != 0 {
+                    sizes.first().copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                tracing::debug!(peer = %self.peer, formats, actions, text_max, "clipboard caps");
+                self.clip_ext = Some(ClipPeer {
+                    actions,
+                    formats,
+                    text_max,
+                });
+            }
+            // Somebody over there pasted. Hand over what was held back.
+            ClipboardMessage::Request(formats) => {
+                if formats & clipboard::format::TEXT != 0
+                    && let Some(text) = self.clip_held.clone()
+                {
+                    let mut buf = Vec::new();
+                    msg::write_server_clipboard(&mut buf, &msg::clipboard_provide_text(&text));
+                    self.outbox.push_back(buf);
+                }
+            }
+            // The same question without wanting the answer sent. This side
+            // holds one string or none, and says which.
+            ClipboardMessage::Peek(_) => {
+                let formats = if self.clip_held.is_some() {
+                    clipboard::format::TEXT
+                } else {
+                    0
+                };
+                let mut buf = Vec::new();
+                msg::write_server_clipboard(
+                    &mut buf,
+                    &msg::clipboard_flags(clipboard::action::NOTIFY, formats),
+                );
+                self.outbox.push_back(buf);
+            }
+            // The client copied something. Ask for it: this end always
+            // wants it, because the desk's clipboard has nowhere to defer
+            // the fetch to.
+            ClipboardMessage::Notify(formats) => {
+                if formats & clipboard::format::TEXT != 0 {
+                    let mut buf = Vec::new();
+                    msg::write_server_clipboard(
+                        &mut buf,
+                        &msg::clipboard_flags(clipboard::action::REQUEST, clipboard::format::TEXT),
+                    );
+                    self.outbox.push_back(buf);
+                }
+            }
+            ClipboardMessage::Provide { text: Some(text) } => self.onto_the_desk(text),
+            // A provide carrying only formats this build does not read.
+            ClipboardMessage::Provide { text: None } => {}
+            ClipboardMessage::Unknown(flags) => {
+                tracing::debug!(peer = %self.peer, flags, "clipboard action not known here");
+            }
+        }
+    }
+
+    /// Put a client's text on the desk's clipboard.
+    fn onto_the_desk(&mut self, text: String) {
+        tracing::debug!(peer = %self.peer, bytes = text.len(), "clipboard in");
+        self.shared.clipboard.lock().set(&text);
+        // The platform reports this back as a change a moment later. It came
+        // from this client, so it is not news to this client.
+        self.clip_echo = Some(text);
     }
 
     /// Hand one thing to the writer: a control message if any is waiting,
@@ -620,6 +784,25 @@ impl Session {
                     self.outbox.push_back(buf);
                     self.continuous_offered = true;
                 }
+                if list.contains(&encoding::PSEUDO_EXTENDED_CLIPBOARD)
+                    && !self.supports(encoding::PSEUDO_EXTENDED_CLIPBOARD)
+                {
+                    // Both sides open by saying what they can take. This one
+                    // takes text, up to the megabyte the plain message is
+                    // capped at, and answers every action the extension
+                    // defines.
+                    let body = msg::clipboard_caps(
+                        clipboard::format::TEXT,
+                        clipboard::action::REQUEST
+                            | clipboard::action::PEEK
+                            | clipboard::action::NOTIFY
+                            | clipboard::action::PROVIDE,
+                        &[msg::MAX_CUT_TEXT as u32],
+                    );
+                    let mut buf = Vec::new();
+                    msg::write_server_clipboard(&mut buf, &body);
+                    self.outbox.push_back(buf);
+                }
                 if list.contains(&encoding::PSEUDO_FENCE) {
                     // The client can answer a fence, so the link can be
                     // measured and a window is worth keeping.
@@ -674,10 +857,19 @@ impl Session {
             ClientMessage::PointerEvent { buttons, x, y } => {
                 self.shared.input.lock().pointer(x, y, buttons);
             }
-            ClientMessage::ClientCutText(text) => {
-                tracing::debug!(peer = %self.peer, len = text.len(), "cut text (clipboard not wired yet)");
+            ClientMessage::ClientCutText(text) => self.onto_the_desk(text),
+            ClientMessage::ExtendedClipboard(message) => self.extended_clipboard(message),
+            ClientMessage::UnreadableClipboard { flags, why } => {
+                // Dropped, not fatal. See the variant's own note: a paste
+                // this end cannot read is not a reason to take the session
+                // down around it.
+                tracing::debug!(
+                    peer = %self.peer,
+                    flags = format_args!("{flags:#x}"),
+                    error = %why,
+                    "clipboard body not readable; dropped"
+                );
             }
-            ClientMessage::ExtendedClipboard(_) => {}
             ClientMessage::EnableContinuousUpdates {
                 enable,
                 x,

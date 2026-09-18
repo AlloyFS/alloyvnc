@@ -32,8 +32,36 @@ use crate::keysym::{self, Modifier};
 /// One wheel notch, as Windows counts them.
 const NOTCH: i32 = 120;
 
-/// VK_LSHIFT, for the presses a character needs and the client did not ask for.
+/// VK_LSHIFT, for the presses a character needs and the client did not ask
+/// for, and VK_RSHIFT beside it, because a client holding the right one has
+/// to have that one let go rather than the other.
 const VK_LSHIFT: u16 = 0xa0;
+const VK_RSHIFT: u16 = 0xa1;
+
+/// What Shift has to do around one character's keystroke.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shift {
+    /// Nothing: what the client is holding is what the character wants.
+    Leave,
+    /// Press it for the keystroke and let go after. The character the
+    /// client asked for needs Shift and the client is not holding it,
+    /// which is every capital letter from a client that sends the shifted
+    /// keysym without the Shift key.
+    Press,
+    /// Let go for the keystroke and press it again after. The character
+    /// does not want Shift and the client is holding it, so the key on its
+    /// own would give the shifted character instead: a client holding
+    /// Shift and sending `1` would type `!`.
+    Release,
+}
+
+fn shift_for(wants_shift: bool, held: bool) -> Shift {
+    match (wants_shift, held) {
+        (true, false) => Shift::Press,
+        (false, true) => Shift::Release,
+        _ => Shift::Leave,
+    }
+}
 
 fn bit(m: Modifier) -> u8 {
     match m {
@@ -51,6 +79,11 @@ pub struct WinInput {
     origin: (i32, i32),
     /// The modifiers the client is holding, as [`bit`] packs them.
     mods: u8,
+    /// Which Shift keys in particular: bit 0 left, bit 1 right. Both have
+    /// to come up for a character that does not want Shift and both have to
+    /// go back down after, or Windows and the client stop agreeing about
+    /// what is held.
+    shift_down: u8,
     /// The button mask of the last pointer event, so a new one can be read
     /// as the presses and releases between the two.
     buttons: u8,
@@ -66,6 +99,7 @@ impl WinInput {
         WinInput {
             origin,
             mods: 0,
+            shift_down: 0,
             buttons: 0,
             reported: false,
         }
@@ -145,6 +179,27 @@ impl WinInput {
         }
     }
 
+    /// The Shift keys the client is holding, left first.
+    ///
+    /// Both, if it is holding both: letting go of one and leaving the other
+    /// down would produce the shifted character anyway, which is the whole
+    /// thing this is here to avoid.
+    fn shift_keys(&self) -> Vec<u16> {
+        let mut keys = Vec::with_capacity(2);
+        if self.shift_down & 1 != 0 {
+            keys.push(VK_LSHIFT);
+        }
+        if self.shift_down & 2 != 0 {
+            keys.push(VK_RSHIFT);
+        }
+        // A client that reported Shift without saying which one still has
+        // to have something let go of.
+        if keys.is_empty() {
+            keys.push(VK_LSHIFT);
+        }
+        keys
+    }
+
     fn mouse_event(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
         INPUT {
             r#type: INPUT_MOUSE,
@@ -181,22 +236,32 @@ impl WinInput {
                 let wants = (scan >> 8) & 0xff;
                 if wants & 0b110 == 0 {
                     let event = Self::key_event(vk, false, down);
-                    let needs_shift = wants & 1 != 0;
-                    if down && needs_shift && self.mods & bit(Modifier::Shift) == 0 {
-                        // The character is produced by the key going down,
-                        // so Shift can be let go in the same batch. The
-                        // release that follows arrives unshifted and does
-                        // no harm. A client holding Shift already sends the
-                        // shifted keysym, which is why its own state is
-                        // asked first: pressing Shift twice would leave it
-                        // stuck down after the first release.
-                        self.send(&[
+                    // The character is produced by the key going down, so
+                    // whatever Shift has to do can be undone in the same
+                    // batch: the release that follows arrives with Shift
+                    // back where the client left it and does no harm. The
+                    // client's own state is asked first, or a client that
+                    // is genuinely holding Shift would have it pressed
+                    // twice and left stuck down after one release.
+                    let held = self.mods & bit(Modifier::Shift) != 0;
+                    match (down, shift_for(wants & 1 != 0, held)) {
+                        (true, Shift::Press) => self.send(&[
                             Self::key_event(VK_LSHIFT, false, true),
                             event,
                             Self::key_event(VK_LSHIFT, false, false),
-                        ]);
-                    } else {
-                        self.send(&[event]);
+                        ]),
+                        (true, Shift::Release) => {
+                            let mut batch = Vec::with_capacity(5);
+                            for vk in self.shift_keys() {
+                                batch.push(Self::key_event(vk, false, false));
+                            }
+                            batch.push(event);
+                            for vk in self.shift_keys() {
+                                batch.push(Self::key_event(vk, false, true));
+                            }
+                            self.send(&batch);
+                        }
+                        _ => self.send(&[event]),
                     }
                     return;
                 }
@@ -223,6 +288,16 @@ impl Input for WinInput {
                 self.mods |= bit(m);
             } else {
                 self.mods &= !bit(m);
+            }
+            // Shift_L and Shift_R are one modifier and two keys, and the
+            // one that has to be let go of is the one that went down.
+            if m == Modifier::Shift {
+                let side = if keysym == 0xffe1 { 1 } else { 2 };
+                if down {
+                    self.shift_down |= side;
+                } else {
+                    self.shift_down &= !side;
+                }
             }
         }
         if let Some(key) = keysym::special(keysym) {
@@ -297,6 +372,41 @@ impl Input for WinInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four cases, of which one was missing: a client holding Shift
+    /// and asking for a character the layout gives unshifted.
+    #[test]
+    fn shift_is_pressed_or_let_go_of_to_match_the_character() {
+        // A capital from a client that sends the shifted keysym without
+        // holding the key.
+        assert_eq!(shift_for(true, false), Shift::Press);
+        // A digit from a client that is holding Shift for its own reasons.
+        // Without this the key gives the shifted character: `1` types `!`.
+        assert_eq!(shift_for(false, true), Shift::Release);
+        // And the two that need nothing.
+        assert_eq!(shift_for(true, true), Shift::Leave);
+        assert_eq!(shift_for(false, false), Shift::Leave);
+    }
+
+    /// Which Shift comes up is the one the client put down.
+    #[test]
+    fn the_shift_let_go_of_is_the_one_being_held() {
+        let mut input = WinInput::new((0, 0));
+        assert_eq!(input.shift_keys(), [VK_LSHIFT], "nothing held, so the left one");
+
+        input.key(0xffe2, true); // Shift_R down
+        assert_eq!(input.shift_keys(), [VK_RSHIFT]);
+        input.key(0xffe1, true); // and Shift_L as well
+        assert_eq!(
+            input.shift_keys(),
+            [VK_LSHIFT, VK_RSHIFT],
+            "both, or the other still shifts"
+        );
+        input.key(0xffe2, false);
+        assert_eq!(input.shift_keys(), [VK_LSHIFT]);
+        input.key(0xffe1, false);
+        assert_eq!(input.shift_down, 0);
+    }
 
     #[test]
     fn absolute_spans_the_whole_desktop() {

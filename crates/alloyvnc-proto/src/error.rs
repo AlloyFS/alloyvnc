@@ -23,4 +23,6 @@ pub enum Error {
     },
     #[error("{0} is truncated")]
     Truncated(&'static str),
+    #[error("extended clipboard: {0}")]
+    Clipboard(&'static str),
 }

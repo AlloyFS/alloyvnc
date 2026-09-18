@@ -24,8 +24,8 @@ use alloyvnc::session::SessionConfig;
 use alloyvnc::shared::Shared;
 use alloyvnc::stats;
 use alloyvnc_proto::encoding;
-use alloyvnc_screen::NullInput;
 use alloyvnc_screen::synth::{Pace, Synth};
+use alloyvnc_screen::{NullClipboard, NullInput};
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
@@ -51,7 +51,13 @@ async fn main() {
 }
 
 async fn run(label: &str, pause: Duration) {
-    let shared = Shared::new("pace", WIDTH, HEIGHT, Box::new(NullInput));
+    let shared = Shared::new(
+        "pace",
+        WIDTH,
+        HEIGHT,
+        Box::new(NullInput),
+        Box::new(NullClipboard),
+    );
     let capture = Synth::new(WIDTH, HEIGHT, Pace::Fps(FPS));
     let server = Server::bind(
         "127.0.0.1:0".parse().expect("a loopback address"),

@@ -7,7 +7,7 @@ use alloyvnc::server::Server;
 use alloyvnc::session::SessionConfig;
 use alloyvnc::shared::Shared;
 use alloyvnc_screen::synth::{Pace, Synth};
-use alloyvnc_screen::{Capture, Input, NullInput};
+use alloyvnc_screen::{Capture, Clipboard, Input, NullClipboard, NullInput};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -112,31 +112,35 @@ async fn serve(args: ServeArgs) -> Result<()> {
         );
     }
     let (width, height) = parse_size(&args.size)?;
-    let (capture, input): (Box<dyn Capture>, Box<dyn Input>) = match args.backend {
-        Backend::Synth => (
-            Box::new(Synth::new(width, height, Pace::Fps(args.fps))),
-            Box::new(NullInput),
-        ),
-        // The picture is whatever the monitors make; --size is the
-        // synthetic screen's alone.
-        #[cfg(windows)]
-        Backend::Dxgi => {
-            let capture = open_dxgi()?;
-            let input = alloyvnc_screen_dxgi::WinInput::new(capture.origin());
-            (Box::new(capture), Box::new(input))
-        }
-        // Both halves open their own connection to $DISPLAY: the capture
-        // reads events on the capture thread while input writes from the
-        // session, and one connection is not two streams.
-        #[cfg(target_os = "linux")]
-        Backend::X11 => {
-            let capture = alloyvnc_screen_x11::X11Capture::new(args.display.as_deref())?;
-            let input = alloyvnc_screen_x11::X11Input::new(args.display.as_deref())?;
-            (Box::new(capture), Box::new(input))
-        }
-    };
+    let (capture, input, clipboard): (Box<dyn Capture>, Box<dyn Input>, Box<dyn Clipboard>) =
+        match args.backend {
+            Backend::Synth => (
+                Box::new(Synth::new(width, height, Pace::Fps(args.fps))),
+                Box::new(NullInput),
+                Box::new(NullClipboard),
+            ),
+            // The picture is whatever the monitors make; --size is the
+            // synthetic screen's alone.
+            #[cfg(windows)]
+            Backend::Dxgi => {
+                let capture = open_dxgi()?;
+                let input = alloyvnc_screen_dxgi::WinInput::new(capture.origin());
+                let clipboard = alloyvnc_screen_dxgi::WinClipboard::new();
+                (Box::new(capture), Box::new(input), Box::new(clipboard))
+            }
+            // Both halves open their own connection to $DISPLAY: the capture
+            // reads events on the capture thread while input writes from the
+            // session, and one connection is not two streams.
+            #[cfg(target_os = "linux")]
+            Backend::X11 => {
+                let capture = alloyvnc_screen_x11::X11Capture::new(args.display.as_deref())?;
+                let input = alloyvnc_screen_x11::X11Input::new(args.display.as_deref())?;
+                let clipboard = alloyvnc_screen_x11::X11Clipboard::new(args.display.as_deref())?;
+                (Box::new(capture), Box::new(input), Box::new(clipboard))
+            }
+        };
     let (width, height) = capture.size();
-    let shared = Shared::new(args.name, width, height, input);
+    let shared = Shared::new(args.name, width, height, input, clipboard);
     let session = SessionConfig {
         password: args.password,
         max_fps: args.max_fps,
